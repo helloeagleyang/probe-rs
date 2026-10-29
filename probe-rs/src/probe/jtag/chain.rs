@@ -321,6 +321,7 @@ impl<'p> JtagChain<'p> {
 
         let mut batch = JtagBatch::new();
         let mut capture_handles = Vec::new();
+        let mut selected_ir = None;
 
         for (idx, command) in writes.iter() {
             match command {
@@ -335,8 +336,16 @@ impl<'p> JtagChain<'p> {
                         ));
                     }
 
-                    let ir = BitSequence::from_bytes(&write.inner.address.to_le_bytes(), ir_len);
-                    self.shift_ir(&mut batch, &ir);
+                    if selected_ir != Some(write.inner.address) {
+                        let ir =
+                            BitSequence::from_bytes(&write.inner.address.to_le_bytes(), ir_len);
+                        self.shift_ir(&mut batch, &ir);
+                        // OpenOCD's select_dmi ends the IR scan in IDLE; match
+                        // that scan boundary so batched DMI waveforms stay
+                        // recognizable to the adapter.
+                        batch.enter(TapState::RunTestIdle);
+                        selected_ir = Some(write.inner.address);
+                    }
                     let handle = self.exchange_dr(&mut batch, &write.inner.data);
                     self.run_test_idle(&mut batch, write.inner.idle_cycles);
                     if idx.should_capture() {

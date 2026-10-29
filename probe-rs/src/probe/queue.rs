@@ -195,6 +195,10 @@ impl<Op, E: std::error::Error + Send + Sync + 'static> Batch<Op, E> {
         self.batch.iter()
     }
 
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut (HandleId, Op)> {
+        self.batch.commands[self.batch.cursor..].iter_mut()
+    }
+
     /// Execute the batch and return results with typed errors.
     ///
     /// # Errors
@@ -249,6 +253,13 @@ impl Results {
 
     pub(crate) fn merge_from(&mut self, other: Results) {
         self.0.extend(other.0);
+        self.0.retain(|k, _| k.should_capture());
+    }
+
+    pub(crate) fn merge_missing_from(&mut self, other: Results) {
+        for (id, value) in other.0 {
+            self.0.entry(id).or_insert(value);
+        }
         self.0.retain(|k, _| k.should_capture());
     }
 

@@ -48,6 +48,53 @@ pub trait DtmAccess: fmt::Debug {
     /// Schedule a read from an address on the `dmi` bus.
     fn schedule_read(&mut self, address: u64) -> Result<Handle<CommandResult>, RiscvError>;
 
+    /// Schedule consecutive reads of one register, preserving their order.
+    fn schedule_read_repeated(
+        &mut self,
+        address: u64,
+        count: usize,
+        _extra_idle: u8,
+    ) -> Result<Vec<Handle<CommandResult>>, RiscvError> {
+        (0..count).map(|_| self.schedule_read(address)).collect()
+    }
+
+    /// Whether repeated abstract-command triggers can be batched with idle clocks.
+    fn supports_abstract_batching(&self) -> bool {
+        false
+    }
+
+    /// Queue register reads with the indicated extra idle clocks after each request.
+    fn schedule_read_sequence(
+        &mut self,
+        requests: &[(u64, u8)],
+    ) -> Result<Vec<Handle<CommandResult>>, RiscvError> {
+        requests
+            .iter()
+            .map(|&(address, _)| self.schedule_read(address))
+            .collect()
+    }
+
+    /// Queue register writes with the indicated extra idle clocks after each request.
+    fn schedule_write_sequence(&mut self, requests: &[(u64, u32, u8)]) -> Result<(), RiscvError> {
+        for &(address, value, _) in requests {
+            self.schedule_write(address, value)?;
+        }
+        Ok(())
+    }
+
+    /// Queue repeated writes to an autoexec register, with additional idle clocks.
+    fn schedule_write_repeated(
+        &mut self,
+        address: u64,
+        values: &[u32],
+        _extra_idle: u8,
+    ) -> Result<(), RiscvError> {
+        for value in values {
+            self.schedule_write(address, *value)?;
+        }
+        Ok(())
+    }
+
     /// Read an address on the `dmi` bus. If a busy value is returned, the access is
     /// retried until the transfer either succeeds, or the timeout expires.
     fn read_with_timeout(&mut self, address: u64, timeout: Duration) -> Result<u32, RiscvError>;
@@ -65,4 +112,55 @@ pub trait DtmAccess: fmt::Debug {
 
     /// Returns an idcode used for chip detection
     fn read_idcode(&mut self) -> Result<Option<u32>, DebugProbeError>;
+
+    /// Whether the transport advertises a probe-side memory engine.
+    fn supports_memory_access(&self, _progbuf: bool) -> bool {
+        false
+    }
+
+    /// Optional probe-side block read through the target's System Bus Access
+    /// engine. Returning `None` keeps the generic DMI-driven SBA path.
+    fn read_memory_sba(
+        &mut self,
+        _access_size: u8,
+        _address: u64,
+        _data: &mut [u8],
+    ) -> Option<Result<(), RiscvError>> {
+        None
+    }
+
+    /// Optional probe-side block write through the target's System Bus Access
+    /// engine. Returning `None` keeps the generic DMI-driven SBA path.
+    fn write_memory_sba(
+        &mut self,
+        _access_size: u8,
+        _address: u64,
+        _data: &[u8],
+    ) -> Option<Result<(), RiscvError>> {
+        None
+    }
+
+    /// Optional probe-side block read through the target's Program Buffer.
+    /// Returning `None` keeps the generic DMI-driven Program Buffer path.
+    fn read_memory_progbuf(
+        &mut self,
+        _hart: u32,
+        _access_size: u8,
+        _address: u64,
+        _data: &mut [u8],
+    ) -> Option<Result<(), RiscvError>> {
+        None
+    }
+
+    /// Optional probe-side block write through the target's Program Buffer.
+    /// Returning `None` keeps the generic DMI-driven Program Buffer path.
+    fn write_memory_progbuf(
+        &mut self,
+        _hart: u32,
+        _access_size: u8,
+        _address: u64,
+        _data: &[u8],
+    ) -> Option<Result<(), RiscvError>> {
+        None
+    }
 }

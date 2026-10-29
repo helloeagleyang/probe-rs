@@ -16,16 +16,21 @@ use crate::architecture::riscv::dtm::DtmAccess;
 use crate::probe::DebugProbeError;
 use crate::probe::common::valid_idcode;
 use crate::probe::jtag::chain::JtagChain;
-use crate::probe::queue::{BatchError, Handle, JtagQueue, Results};
+use crate::probe::queue::{BatchError, Handle, HandleId, JtagQueue, Results};
 use crate::probe::{
-    BitSequence, CommandResult, JtagBatch, JtagWriteCommand, JtagWriteData, ShiftDrCommand,
-    ShiftDrData,
+    BitSequence, CommandResult, JtagBatch, JtagCommand, JtagWriteCommand, JtagWriteData,
+    ShiftDrCommand, ShiftDrData,
 };
 
 #[derive(Debug, Default)]
 struct DtmState {
     queued_commands: JtagQueue<DmiOperationError>,
     jtag_results: Results,
+    // A scan reports the preceding request's status even when its own result
+    // was discarded. Keep all scan responses until the batch has been checked.
+    scan_checks: Vec<HandleId>,
+    pipelined: bool,
+    last_is_nop: bool,
 
     /// Number of address bits in the DMI register
     abits: u32,
@@ -154,73 +159,121 @@ impl<'probe> JtagDtm<'probe> {
         }
     }
 
-    /// Perform an access to the dmi register of the JTAG Transport module.
-    ///
-    /// Every access both writes and reads from the register, which means a value is always
-    /// returned. The `op` is checked for errors, and if it is not equal to zero, an error is returned.
-    fn dmi_register_access(
-        &mut self,
-        op: DmiOperation,
-    ) -> Result<Result<u32, DmiOperationError>, DebugProbeError> {
-        let bytes = op.to_byte_batch();
-
-        let bit_size = self.state.abits + DMI_ADDRESS_BIT_OFFSET;
-
-        let response = self.exchange_register(
-            DMI_ADDRESS,
-            BitSequence::from_bytes(&bytes, bit_size as usize),
-            self.state.idle_cycles as u32,
-        )?;
-        Ok(Self::transform_dmi_result(response.as_bits()))
-    }
-
     fn schedule_dmi_register_access(
         &mut self,
         op: DmiOperation,
+    ) -> Result<Handle<CommandResult>, RiscvError> {
+        self.schedule_dmi_register_access_with_idle(op, 0)
+    }
+
+    fn schedule_dmi_register_access_with_idle(
+        &mut self,
+        op: DmiOperation,
+        extra_idle: u8,
     ) -> Result<Handle<CommandResult>, RiscvError> {
         let bytes = op.to_byte_batch();
 
         let bit_size = self.state.abits + DMI_ADDRESS_BIT_OFFSET;
 
-        Ok(self.state.queued_commands.schedule(JtagWriteCommand {
+        let handle = self.state.queued_commands.schedule(JtagWriteCommand {
             data: JtagWriteData {
                 address: DMI_ADDRESS,
                 data: BitSequence::from_bytes(&bytes, bit_size as usize),
-                idle_cycles: self.state.idle_cycles as u32,
+                idle_cycles: self.state.idle_cycles.saturating_add(extra_idle) as u32,
             },
             transform: |_, result| Self::transform_dmi_result(result).map(CommandResult::U32),
-        }))
+        });
+        self.state.scan_checks.push(handle.id().clone());
+        self.state.last_is_nop = matches!(op, DmiOperation::NoOp);
+        Ok(handle)
     }
 
-    fn dmi_register_access_with_timeout(
-        &mut self,
-        op: DmiOperation,
-        timeout: Duration,
-    ) -> Result<u32, RiscvError> {
-        let start_time = Instant::now();
+    fn execute_with_timeout(&mut self, timeout: Duration) -> Result<(), RiscvError> {
+        if !self.state.queued_commands.is_empty() && !self.state.last_is_nop {
+            // The last request's status arrives on the next scan.
+            self.schedule_dmi_register_access(DmiOperation::NoOp)?;
+        }
+        self.state.last_is_nop = false;
+        let mut cmds = std::mem::take(&mut self.state.queued_commands);
+        let checks = std::mem::take(&mut self.state.scan_checks);
+        let pipelined = std::mem::take(&mut self.state.pipelined);
 
-        self.execute()?;
-
-        loop {
-            match self.dmi_register_access(op)? {
-                Ok(result) => return Ok(result),
-                Err(DmiOperationError::RequestInProgress) => {
-                    // Operation still in progress, reset dmi status and try again.
-                    self.clear_error_state()?;
-                    self.state.idle_cycles = self.state.idle_cycles.saturating_add(1);
+        let mut started = Instant::now();
+        let mut previous_queue_len = cmds.len();
+        while !cmds.is_empty() {
+            match cmds.execute(|queue| self.probe.run_command_batch(queue)) {
+                Ok(r) => {
+                    drop(checks);
+                    drop(cmds);
+                    self.state.jtag_results.merge_missing_from(r);
+                    return Ok(());
                 }
-                // A reserved status is defined to be interpreted like a failure.
-                Err(DmiOperationError::Reserved | DmiOperationError::OperationFailed) => {
-                    // The failure is sticky. Clear it, or the DTM ignores every later access.
-                    self.clear_error_state()?;
-                    return Err(RiscvError::DtmOperationFailed);
-                }
-            };
+                Err(e) => {
+                    match e.error {
+                        BatchError::Specific(error) => {
+                            // error is now DmiOperationError, not Box<dyn Error>
+                            match error {
+                                DmiOperationError::RequestInProgress => {
+                                    self.clear_error_state()?;
 
-            if start_time.elapsed() > timeout {
+                                    if pipelined {
+                                        // The target may have already consumed part of a
+                                        // side-effecting read stream; do not replay it.
+                                        return Err(RiscvError::DtmOperationFailed);
+                                    }
+
+                                    // A DMI scan reports the *previous* scan. The
+                                    // request that returned busy must be sent again,
+                                    // not just the scan that observed its response.
+                                    cmds.consume(e.results.len().saturating_sub(1));
+                                    self.state.jtag_results.merge_missing_from(e.results);
+
+                                    self.state.idle_cycles =
+                                        self.state.idle_cycles.saturating_add(1);
+                                    for (_, command) in cmds.iter_mut() {
+                                        match command {
+                                            JtagCommand::WriteRegister(write) => {
+                                                write.inner.idle_cycles =
+                                                    write.inner.idle_cycles.saturating_add(1);
+                                            }
+                                            JtagCommand::ShiftDr(shift) => {
+                                                shift.inner.idle_cycles =
+                                                    shift.inner.idle_cycles.saturating_add(1);
+                                            }
+                                        }
+                                    }
+                                }
+                                DmiOperationError::Reserved
+                                | DmiOperationError::OperationFailed => {
+                                    self.clear_error_state()?;
+                                    return Err(RiscvError::DtmOperationFailed);
+                                }
+                            }
+                        }
+                        BatchError::Probe(error) => {
+                            return Err(error.into());
+                        }
+                    }
+                }
+            }
+
+            // If progress was made, reset the timeout.
+            if cmds.len() != previous_queue_len {
+                started = Instant::now();
+                previous_queue_len = cmds.len();
+            }
+
+            let elapsed_time = started.elapsed();
+
+            if elapsed_time > timeout {
+                tracing::error!(
+                    "Timeout ({timeout:?}) exceeded executing RISCV commands (elapsed: {elapsed_time:?})"
+                );
                 return Err(RiscvError::Timeout);
             }
         }
+
+        Ok(())
     }
 }
 
@@ -303,62 +356,7 @@ impl DtmAccess for JtagDtm<'_> {
     }
 
     fn execute(&mut self) -> Result<(), RiscvError> {
-        let mut cmds = std::mem::take(&mut self.state.queued_commands);
-
-        let mut started = Instant::now();
-        let mut previous_queue_len = cmds.len();
-        while !cmds.is_empty() {
-            match cmds.execute(|queue| self.probe.run_command_batch(queue)) {
-                Ok(r) => {
-                    self.state.jtag_results.merge_from(r);
-                    return Ok(());
-                }
-                Err(e) => {
-                    match e.error {
-                        BatchError::Specific(error) => {
-                            // error is now DmiOperationError, not Box<dyn Error>
-                            match error {
-                                DmiOperationError::RequestInProgress => {
-                                    self.clear_error_state()?;
-
-                                    // queue up the remaining commands when we retry
-                                    cmds.consume(e.results.len());
-                                    self.state.jtag_results.merge_from(e.results);
-
-                                    self.state.idle_cycles =
-                                        self.state.idle_cycles.saturating_add(1);
-                                }
-                                DmiOperationError::Reserved
-                                | DmiOperationError::OperationFailed => {
-                                    self.clear_error_state()?;
-                                    return Err(RiscvError::DtmOperationFailed);
-                                }
-                            }
-                        }
-                        BatchError::Probe(error) => {
-                            return Err(error.into());
-                        }
-                    }
-                }
-            }
-
-            // If progress was made, reset the timeout.
-            if cmds.len() != previous_queue_len {
-                started = Instant::now();
-                previous_queue_len = cmds.len();
-            }
-
-            let elapsed_time = started.elapsed();
-
-            if elapsed_time > JTAG_COMMAND_TIMEOUT {
-                tracing::error!(
-                    "Timeout ({JTAG_COMMAND_TIMEOUT:?}) exceeded executing RISCV commands (elapsed: {elapsed_time:?})"
-                );
-                return Err(RiscvError::Timeout);
-            }
-        }
-
-        Ok(())
+        self.execute_with_timeout(JTAG_COMMAND_TIMEOUT)
     }
 
     fn schedule_write(
@@ -378,11 +376,97 @@ impl DtmAccess for JtagDtm<'_> {
         self.schedule_dmi_register_access(DmiOperation::NoOp)
     }
 
-    fn read_with_timeout(&mut self, address: u64, timeout: Duration) -> Result<u32, RiscvError> {
-        // Prepare the read by sending a read request with the register address
-        self.schedule_dmi_register_access(DmiOperation::Read { address })?;
+    fn schedule_read_repeated(
+        &mut self,
+        address: u64,
+        count: usize,
+        extra_idle: u8,
+    ) -> Result<Vec<Handle<CommandResult>>, RiscvError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        self.schedule_dmi_register_access_with_idle(DmiOperation::Read { address }, extra_idle)?;
+        self.state.pipelined = true;
+        let mut results = Vec::with_capacity(count);
+        for _ in 1..count {
+            results.push(self.schedule_dmi_register_access_with_idle(
+                DmiOperation::Read { address },
+                extra_idle,
+            )?);
+        }
+        results.push(self.schedule_dmi_register_access(DmiOperation::NoOp)?);
+        Ok(results)
+    }
 
-        self.dmi_register_access_with_timeout(DmiOperation::NoOp, timeout)
+    fn supports_abstract_batching(&self) -> bool {
+        true
+    }
+
+    fn schedule_read_sequence(
+        &mut self,
+        requests: &[(u64, u8)],
+    ) -> Result<Vec<Handle<CommandResult>>, RiscvError> {
+        let Some((&(first_address, first_idle), rest)) = requests.split_first() else {
+            return Ok(Vec::new());
+        };
+        self.schedule_dmi_register_access_with_idle(
+            DmiOperation::Read {
+                address: first_address,
+            },
+            first_idle,
+        )?;
+        self.state.pipelined = true;
+        let mut results = Vec::with_capacity(requests.len());
+        for &(address, idle) in rest {
+            results.push(
+                self.schedule_dmi_register_access_with_idle(DmiOperation::Read { address }, idle)?,
+            );
+        }
+        results.push(self.schedule_dmi_register_access(DmiOperation::NoOp)?);
+        Ok(results)
+    }
+
+    fn schedule_write_sequence(&mut self, requests: &[(u64, u32, u8)]) -> Result<(), RiscvError> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        for &(address, value, idle) in requests {
+            self.schedule_dmi_register_access_with_idle(
+                DmiOperation::Write { address, value },
+                idle,
+            )?;
+        }
+        self.schedule_dmi_register_access(DmiOperation::NoOp)?;
+        self.state.pipelined = true;
+        Ok(())
+    }
+
+    fn schedule_write_repeated(
+        &mut self,
+        address: u64,
+        values: &[u32],
+        extra_idle: u8,
+    ) -> Result<(), RiscvError> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        for &value in values {
+            self.schedule_dmi_register_access_with_idle(
+                DmiOperation::Write { address, value },
+                extra_idle,
+            )?;
+        }
+        // DMI errors are sticky, so the final NOP reports an error from any
+        // write in this batch. An error is returned without replaying writes.
+        self.schedule_dmi_register_access(DmiOperation::NoOp)?;
+        self.state.pipelined = true;
+        Ok(())
+    }
+
+    fn read_with_timeout(&mut self, address: u64, timeout: Duration) -> Result<u32, RiscvError> {
+        let handle = self.schedule_read(address)?;
+        self.execute_with_timeout(timeout)?;
+        Ok(self.read_deferred_result(handle)?.into_u32())
     }
 
     fn write_with_timeout(
@@ -391,8 +475,10 @@ impl DtmAccess for JtagDtm<'_> {
         value: u32,
         timeout: Duration,
     ) -> Result<Option<u32>, RiscvError> {
-        self.dmi_register_access_with_timeout(DmiOperation::Write { address, value }, timeout)
-            .map(Some)
+        self.schedule_write(address, value)?;
+        let handle = self.schedule_dmi_register_access(DmiOperation::NoOp)?;
+        self.execute_with_timeout(timeout)?;
+        Ok(Some(self.read_deferred_result(handle)?.into_u32()))
     }
 
     fn read_idcode(&mut self) -> Result<Option<u32>, DebugProbeError> {
@@ -979,6 +1065,249 @@ bitfield! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::{
+        BatchExecutionError, DebugProbe, JtagChainAccess, JtagChainState, JtagOp, JtagProbe,
+        TapState, WireProtocol,
+    };
+
+    #[derive(Debug)]
+    struct DmiProbe {
+        state: JtagChainState,
+        ir: u32,
+        response: u64,
+        sticky: bool,
+        busy_on_read: usize,
+        busy_on_write: usize,
+        reads: Vec<u64>,
+        writes: Vec<(u64, u32)>,
+        max_idle: u32,
+    }
+
+    impl DmiProbe {
+        fn new(busy_on_read: usize) -> Self {
+            let mut state = JtagChainState::default();
+            state.chain_params.irlen = 5;
+            Self {
+                state,
+                ir: 0,
+                response: 0,
+                sticky: false,
+                busy_on_read,
+                busy_on_write: usize::MAX,
+                reads: Vec::new(),
+                writes: Vec::new(),
+                max_idle: 0,
+            }
+        }
+    }
+
+    impl DebugProbe for DmiProbe {
+        fn get_name(&self) -> &str {
+            "DMI test"
+        }
+        fn speed_khz(&self) -> u32 {
+            0
+        }
+        fn set_speed(&mut self, speed: u32) -> Result<u32, DebugProbeError> {
+            Ok(speed)
+        }
+        fn attach(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+        fn detach(&mut self) -> Result<(), crate::Error> {
+            Ok(())
+        }
+        fn target_reset(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+        fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+        fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+        fn set_reset_line_connected(&mut self, _: bool) {}
+        fn select_protocol(&mut self, _: WireProtocol) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+        fn active_protocol(&self) -> Option<WireProtocol> {
+            Some(WireProtocol::Jtag)
+        }
+        fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
+            self
+        }
+    }
+
+    impl JtagChainAccess for DmiProbe {
+        fn chain_state(&mut self) -> &mut JtagChainState {
+            &mut self.state
+        }
+        fn chain_state_ref(&self) -> &JtagChainState {
+            &self.state
+        }
+    }
+
+    impl JtagProbe for DmiProbe {
+        fn run_batch(
+            &mut self,
+            batch: &JtagBatch,
+        ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
+            let mut results = Results::new();
+            for (id, op) in batch.iter() {
+                match op {
+                    JtagOp::EnterState(state) => self.state.tap_state = *state,
+                    JtagOp::ClockTck { count } => self.max_idle = self.max_idle.max(*count),
+                    JtagOp::Exchange { data, capture } => {
+                        let bits = data.as_bits().load_le::<u64>();
+                        let mut response = 0;
+                        match self.state.tap_state {
+                            TapState::ShiftIr => self.ir = bits as u32,
+                            TapState::ShiftDr if self.ir == DMI_ADDRESS => {
+                                response = self.response;
+                                let operation = bits & 3;
+                                let address = bits >> DMI_ADDRESS_BIT_OFFSET;
+                                if operation == 1 {
+                                    self.reads.push(address);
+                                    if self.reads.len() == self.busy_on_read {
+                                        self.sticky = true;
+                                    }
+                                    self.response = if self.sticky {
+                                        3
+                                    } else {
+                                        (0xa500_0000 | address) << 2
+                                    };
+                                } else if operation == 2 {
+                                    self.writes.push((address, (bits >> 2) as u32));
+                                    if self.writes.len() == self.busy_on_write {
+                                        self.sticky = true;
+                                    }
+                                    self.response = if self.sticky { 3 } else { 0 };
+                                } else {
+                                    self.response = if self.sticky { 3 } else { 0 };
+                                }
+                            }
+                            TapState::ShiftDr
+                                if self.ir == DTMCS_ADDRESS && bits & (1 << 16) != 0 =>
+                            {
+                                self.sticky = false;
+                                self.response = 0;
+                            }
+                            _ => {}
+                        }
+                        if *capture && id.should_capture() {
+                            results.push(id, CommandResult::VecU8(response.to_le_bytes().to_vec()));
+                        }
+                    }
+                }
+            }
+            Ok(results)
+        }
+    }
+
+    #[test]
+    fn dmi_busy_retries_the_request_and_preserves_previous_read() {
+        let mut probe = DmiProbe::new(2);
+        let mut state = DtmState {
+            abits: 7,
+            ..Default::default()
+        };
+        let mut dtm = JtagDtm::new(JtagChain::new(&mut probe), &mut state);
+        let first = dtm.schedule_read(0x11).unwrap();
+        let second = dtm.schedule_read(0x12).unwrap();
+        assert_eq!(
+            dtm.read_deferred_result(first).unwrap().into_u32(),
+            0xa500_0011
+        );
+        assert_eq!(
+            dtm.read_deferred_result(second).unwrap().into_u32(),
+            0xa500_0012
+        );
+        assert_eq!(probe.reads, [0x11, 0x12, 0x12]);
+        assert!(probe.max_idle > 0);
+    }
+
+    #[test]
+    fn dmi_busy_does_not_replay_a_side_effecting_read_stream() {
+        let mut probe = DmiProbe::new(1);
+        let mut state = DtmState {
+            abits: 7,
+            ..Default::default()
+        };
+        let mut dtm = JtagDtm::new(JtagChain::new(&mut probe), &mut state);
+        let _handles = dtm.schedule_read_repeated(0x3c, 3, 0).unwrap();
+        assert!(matches!(dtm.execute(), Err(RiscvError::DtmOperationFailed)));
+        assert_eq!(probe.reads, [0x3c, 0x3c, 0x3c]);
+    }
+
+    #[test]
+    fn pipelined_register_sequence_returns_each_response_in_order() {
+        let mut probe = DmiProbe::new(usize::MAX);
+        let mut state = DtmState {
+            abits: 7,
+            ..Default::default()
+        };
+        let mut dtm = JtagDtm::new(JtagChain::new(&mut probe), &mut state);
+        let handles = dtm
+            .schedule_read_sequence(&[(4, 0), (5, 0), (6, 9), (4, 0)])
+            .unwrap();
+        let values: Vec<u32> = handles
+            .into_iter()
+            .map(|handle| dtm.read_deferred_result(handle).unwrap().into_u32())
+            .collect();
+        assert_eq!(values, [0xa500_0004, 0xa500_0005, 0xa500_0006, 0xa500_0004]);
+        assert_eq!(probe.reads, [4, 5, 6, 4]);
+        assert!(probe.max_idle >= 9);
+    }
+
+    #[test]
+    fn dmi_busy_does_not_replay_a_side_effecting_write_stream() {
+        let mut probe = DmiProbe::new(usize::MAX);
+        probe.busy_on_write = 2;
+        let mut state = DtmState {
+            abits: 7,
+            ..Default::default()
+        };
+        let mut dtm = JtagDtm::new(JtagChain::new(&mut probe), &mut state);
+        dtm.schedule_write_sequence(&[(4, 11, 0), (5, 22, 0), (6, 33, 7)])
+            .unwrap();
+        assert!(matches!(dtm.execute(), Err(RiscvError::DtmOperationFailed)));
+        assert_eq!(probe.writes, [(4, 11), (5, 22), (6, 33)]);
+    }
+
+    #[test]
+    fn dmi_busy_retries_the_write_whose_response_was_busy() {
+        let mut probe = DmiProbe::new(usize::MAX);
+        probe.busy_on_write = 1;
+        let mut state = DtmState {
+            abits: 7,
+            ..Default::default()
+        };
+        let mut dtm = JtagDtm::new(JtagChain::new(&mut probe), &mut state);
+        dtm.write_with_timeout(4, 0x1234, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(probe.writes, [(4, 0x1234), (4, 0x1234)]);
+        assert!(probe.max_idle > 0);
+    }
+
+    #[test]
+    fn discarded_write_results_still_check_each_dmi_status() {
+        for (busy_on, expected) in [
+            (1, vec![(4, 11), (5, 22), (4, 11), (5, 22)]),
+            (2, vec![(4, 11), (5, 22), (5, 22)]),
+        ] {
+            let mut probe = DmiProbe::new(usize::MAX);
+            probe.busy_on_write = busy_on;
+            let mut state = DtmState {
+                abits: 7,
+                ..Default::default()
+            };
+            let mut dtm = JtagDtm::new(JtagChain::new(&mut probe), &mut state);
+            dtm.schedule_write(4, 11).unwrap();
+            dtm.schedule_write(5, 22).unwrap();
+            dtm.execute().unwrap();
+            assert_eq!(probe.writes, expected);
+        }
+    }
 
     #[test]
     fn tunneled_dmi_batch_bit_width() {

@@ -1,0 +1,1 @@
+RISC-V JTAG batches now select the instruction register once and pause in Run-Test/Idle before each DR scan, removing a per-access IR shift from batched DMI traffic and matching OpenOCD's `select_dmi` scan boundary.
