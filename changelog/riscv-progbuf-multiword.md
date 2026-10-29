@@ -1,0 +1,1 @@
+Added opt-in multiword RISC-V Program Buffer RAM transfers through the hart-visible data window, with bounded JTAG batches and adaptive abstract-command timing. The feature is for RAM because busy recovery may repeat reads.

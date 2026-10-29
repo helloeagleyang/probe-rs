@@ -34,6 +34,9 @@ pub enum RiscvError {
     /// An error occurred during the execution of an abstract command.
     #[error("Error occurred during execution of an abstract command: {0:?}")]
     AbstractCommand(AbstractCommandErrorKind),
+    /// Program Buffer state could not be made safe for register access or resume.
+    #[error("Program Buffer cleanup failed; the hart remains halted: {0}")]
+    ProgramBufferCleanupFailed(Box<RiscvError>),
     /// Value does not fit into the abstract command argument width
     #[error("Abstract command argument value {0:#x} does not fit in 32 bits")]
     AbstractArgumentOutOfRange(u64),
@@ -309,6 +312,10 @@ pub trait CacheSync: Debug + Send + Sync {
 pub struct MemoryAccessConfig {
     has_program_buffer: bool,
 
+    /// Opt in to multiword Program Buffer RAM transfers through the data
+    /// window. Defaults to off because busy retries may repeat accesses.
+    progbuf_multiword: bool,
+
     cache_sync: Option<Arc<dyn CacheSync>>,
 
     /// Describes, which memory access method should be used for a given access width
@@ -340,6 +347,16 @@ impl MemoryAccessConfig {
     /// Installs the cache maintenance implementation of the target.
     pub fn set_cache_sync(&mut self, cache_sync: Arc<dyn CacheSync>) {
         self.cache_sync = Some(cache_sync);
+    }
+
+    /// Enables multiword Program Buffer RAM transfers through the data window.
+    pub fn set_progbuf_multiword(&mut self, enabled: bool) {
+        self.progbuf_multiword = enabled;
+    }
+
+    /// Whether multiword Program Buffer transfers are enabled.
+    pub fn progbuf_multiword(&self) -> bool {
+        self.progbuf_multiword
     }
 
     /// Returns the default memory access method for the given access width.
@@ -437,11 +454,26 @@ pub struct RiscvCommunicationInterfaceState {
     /// Number of data registers for abstract commands
     data_register_count: u8,
 
+    /// Hart-visible address of `data0` (`hartinfo.dataaddr`).
+    dataaddr: u32,
+
+    /// Whether the data registers are memory-mapped (`hartinfo.dataaccess`).
+    dataaccess: bool,
+
+    /// Number of hart-visible data words (`hartinfo.datasize`).
+    datasize: u8,
+
     /// Number of scratch registers
     nscratch: u8,
 
     /// Whether the target supports autoexecuting the program buffer
     supports_autoexec: bool,
+
+    /// Extra JTAG idle clocks learned after autoexec busy responses.
+    progbuf_read_idle: u8,
+    progbuf_write_idle: u8,
+    progbuf_multi_read_idle: u8,
+    progbuf_multi_write_idle: u8,
 
     /// Pointer to the configuration string
     confstrptr: Option<u128>,
@@ -529,10 +561,17 @@ impl RiscvCommunicationInterfaceState {
 
             // Set to the minimum here, will be set to the correct value below
             data_register_count: 1,
+            dataaddr: 0,
+            dataaccess: false,
+            datasize: 0,
 
             nscratch: 0,
 
             supports_autoexec: false,
+            progbuf_read_idle: 0,
+            progbuf_write_idle: 0,
+            progbuf_multi_read_idle: 0,
+            progbuf_multi_write_idle: 0,
 
             confstrptr: None,
 
@@ -700,6 +739,10 @@ impl<'state> RiscvCommunicationInterface<'state> {
         self.write_dm_register(control)?;
         self.state.last_selected_hart = hart;
         self.state.is_halted = false;
+        self.state.progbuf_read_idle = 0;
+        self.state.progbuf_write_idle = 0;
+        self.state.progbuf_multi_read_idle = 0;
+        self.state.progbuf_multi_write_idle = 0;
 
         // The currently-selected hart is reflected in `dmstatus`. We selected a new hart above,
         // but if the hart isn't active then the value won't actually change. Read the value
@@ -912,6 +955,10 @@ impl<'state> RiscvCommunicationInterface<'state> {
     /// are supported.
     pub fn enter_debug_mode(&mut self) -> Result<(), RiscvError> {
         tracing::debug!("Building RISC-V interface");
+        self.state.progbuf_read_idle = 0;
+        self.state.progbuf_write_idle = 0;
+        self.state.progbuf_multi_read_idle = 0;
+        self.state.progbuf_multi_write_idle = 0;
         self.dtm.init()?;
 
         // Reset error bits from previous connections
@@ -1058,7 +1105,15 @@ impl<'state> RiscvCommunicationInterface<'state> {
         let hartinfo: Hartinfo = self.read_dm_register()?;
 
         self.state.nscratch = hartinfo.nscratch() as u8;
-        tracing::debug!("Number of dscratch registers: {}", self.state.nscratch);
+        self.state.dataaddr = hartinfo.dataaddr();
+        self.state.dataaccess = hartinfo.dataaccess();
+        self.state.datasize = hartinfo.datasize() as u8;
+        tracing::debug!(
+            "Number of dscratch registers: {}, data window at {:#x} (memory-mapped: {})",
+            self.state.nscratch,
+            self.state.dataaddr,
+            self.state.dataaccess
+        );
 
         // determine if autoexec works
         let mut abstractauto = Abstractauto(0);
@@ -1333,6 +1388,10 @@ impl<'state> RiscvCommunicationInterface<'state> {
         };
 
         let result = op(self);
+
+        if matches!(&result, Err(RiscvError::ProgramBufferCleanupFailed(_))) {
+            return result;
+        }
 
         // Restore the original dcsr.prv when it was not already M-mode.
         // Note: ebreakm is intentionally left set -- it must remain enabled
@@ -1856,27 +1915,26 @@ impl<'state> RiscvCommunicationInterface<'state> {
 
             let data_len = data.len();
 
-            let mut read_results = Vec::with_capacity(data_len);
-            for _ in data[..data_len - 1].iter() {
-                self.schedule_read_large_dtm_register::<V, Sbdata>(&mut read_results)?;
-            }
+            let mut read_results =
+                self.dtm
+                    .schedule_read_repeated(Sbdata0::ADDRESS_OFFSET, data_len - 1, 0)?;
 
             self.schedule_write_dm_register(Sbcs(0))?;
 
             // Read last value
-            self.schedule_read_large_dtm_register::<V, Sbdata>(&mut read_results)?;
+            read_results.push(self.schedule_read_dm_register::<Sbdata0>()?);
 
             let sbcs = self.read_dm_register::<Sbcs>()?;
-
-            for out in data.iter_mut() {
-                *out = V::read_scheduled_result(self, &mut read_results)?;
-            }
 
             // Check that the read was successful
             if sbcs.sberror() != 0 {
                 break Err(RiscvError::SystemBusAccess);
             }
             if !sbcs.sbbusyerror() {
+                for (out, handle) in data.iter_mut().zip(read_results) {
+                    *out =
+                        V::from_register_value(self.dtm.read_deferred_result(handle)?.into_u32());
+                }
                 break Ok(());
             }
             tracing::debug!("System bus was busy while reading, repeating operation");
@@ -1909,6 +1967,32 @@ impl<'state> RiscvCommunicationInterface<'state> {
         let mut clear = Abstractcs(0);
         clear.set_cmderr(0x7);
         self.write_dm_register(clear)
+    }
+
+    fn stop_progbuf_autoexec(&mut self) -> Result<(), RiscvError> {
+        match self.wait_for_abstract_idle(PROGBUF_TIMEOUT) {
+            Ok(()) | Err(RiscvError::AbstractCommand(_)) => {}
+            Err(error) => return Err(error),
+        }
+        self.write_dm_register(Abstractauto(0))?;
+        let autoexec: Abstractauto = self.read_dm_register()?;
+        if autoexec.0 != 0 {
+            return Err(
+                DebugProbeError::Other("could not disable Program Buffer autoexec".into()).into(),
+            );
+        }
+        self.clear_abstract_command_error()
+    }
+
+    fn cleanup_progbuf(&mut self, s0: bool, s1: bool) -> Result<(), RiscvError> {
+        self.state.invalidate_progbuf_cache();
+        self.stop_progbuf_autoexec()
+            .map_err(|error| RiscvError::ProgramBufferCleanupFailed(Box::new(error)))?;
+        let restore_s0 = self.restore_s0(s0);
+        let restore_s1 = self.restore_s1(s1);
+        restore_s0
+            .and(restore_s1)
+            .map_err(|error| RiscvError::ProgramBufferCleanupFailed(Box::new(error)))
     }
 
     /// Wait until the program that the debug module started has finished.
@@ -2020,36 +2104,41 @@ impl<'state> RiscvCommunicationInterface<'state> {
         //     which advances the pipeline by one position.
         //   Teardown: read DATA0 -> data[N-2], read S1 -> data[N-1]
         let loop_count = data_len.saturating_sub(2);
-        let chunk_size: usize = 256;
+        let chunk_size: usize = 128;
         let mut out_idx = 0;
 
         while out_idx < loop_count {
             let batch_end = core::cmp::min(out_idx + chunk_size, loop_count);
             let batch_len = batch_end - out_idx;
 
-            let mut result_idxs = Vec::with_capacity(batch_len);
-            for _ in 0..batch_len {
-                let idx = self.schedule_read_dm_register::<Data0>()?;
-                result_idxs.push(idx);
-                self.wait_for_progbuf()?;
-            }
-
-            for (i, idx) in result_idxs.into_iter().enumerate() {
-                let value = self.dtm.read_deferred_result(idx)?.into_u32();
-                data[out_idx + i] = V::from_register_value(value);
-            }
-
-            match self.wait_for_abstract_idle(PROGBUF_TIMEOUT) {
-                Ok(()) => {
-                    out_idx = batch_end;
+            let result_idxs = if self.dtm.supports_abstract_batching() {
+                self.dtm.schedule_read_repeated(
+                    Data0::ADDRESS_OFFSET,
+                    batch_len,
+                    self.state.progbuf_read_idle,
+                )?
+            } else {
+                let mut results = Vec::with_capacity(batch_len);
+                for _ in 0..batch_len {
+                    results.push(self.schedule_read_dm_register::<Data0>()?);
+                    self.wait_for_progbuf()?;
                 }
+                results
+            };
+
+            let (reliable, re_prime) = match self.wait_for_abstract_idle(PROGBUF_TIMEOUT) {
+                Ok(()) => (batch_end, false),
                 Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy)) => {
                     self.clear_abstract_command_error()?;
                     self.write_dm_register(Abstractauto(0))?;
 
                     let current_addr = self.read_register_xlen(registers::S0)?;
                     let width = V::WIDTH.byte_width() as u64;
-                    let progress = ((current_addr - address) / width) as usize;
+                    let progress = current_addr
+                        .checked_sub(address)
+                        .ok_or(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy))?
+                        / width;
+                    let progress = progress as usize;
                     let reliable = progress.saturating_sub(2);
 
                     tracing::warn!(
@@ -2062,16 +2151,28 @@ impl<'state> RiscvCommunicationInterface<'state> {
                         reliable,
                     );
 
-                    if reliable <= out_idx {
+                    if reliable < out_idx || reliable > batch_end {
                         return Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy));
                     }
-
-                    let new_addr = address + reliable as u64 * width;
-                    self.autoexec_prime_pipeline(new_addr)?;
-                    out_idx = reliable;
+                    let old_delay = self.state.progbuf_read_idle;
+                    self.state.progbuf_read_idle = old_delay.saturating_mul(2).saturating_add(1);
+                    if reliable == out_idx && self.state.progbuf_read_idle == old_delay {
+                        return Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy));
+                    }
+                    (reliable, true)
                 }
                 Err(e) => return Err(e),
+            };
+
+            for (i, idx) in result_idxs.into_iter().take(reliable - out_idx).enumerate() {
+                let value = self.dtm.read_deferred_result(idx)?.into_u32();
+                data[out_idx + i] = V::from_register_value(value);
             }
+            if re_prime {
+                let new_addr = address + reliable as u64 * V::WIDTH.byte_width() as u64;
+                self.autoexec_prime_pipeline(new_addr)?;
+            }
+            out_idx = reliable;
         }
 
         // Teardown: disable autoexec, read final two values.
@@ -2112,10 +2213,11 @@ impl<'state> RiscvCommunicationInterface<'state> {
             command.set_regno((registers::S1).id.0 as u32);
 
             self.schedule_write_dm_register(command)?;
+            // DATA0 cannot be accessed until the transfer/postexec command
+            // has completed; otherwise some DMs latch cmderr=busy.
+            self.wait_for_progbuf()?;
             let value_idx = self.schedule_read_dm_register::<Data0>()?;
             result_idxs.push((out_idx, value_idx));
-
-            self.wait_for_progbuf()?;
         }
 
         let last_value = self.read_register_xlen(registers::S1)? as u32;
@@ -2147,29 +2249,248 @@ impl<'state> RiscvCommunicationInterface<'state> {
             let s0 = core.save_s0()?;
             let s1 = core.save_s1()?;
 
-            let lw_command: u32 = assembly::lw(0, 8, V::WIDTH as u8, 9);
+            let read_result = core.read_multiple_progbuf_dispatch(address, data);
 
-            core.schedule_setup_program_buffer(&[
-                lw_command,
-                assembly::addi(8, 8, V::WIDTH.byte_width() as i16),
-            ])?;
-
-            let use_autoexec = core.state.supports_autoexec && data.len() >= 16;
-
-            let read_result = if use_autoexec {
-                core.read_multiple_autoexec(address, data)
-            } else {
-                core.read_multiple_no_autoexec(address, data)
-            };
-
-            let _ = core.write_dm_register(Abstractauto(0));
-            let _ = core.clear_abstract_command_error();
-            core.state.invalidate_progbuf_cache();
-            let _ = core.restore_s0(s0);
-            let _ = core.restore_s1(s1);
+            core.cleanup_progbuf(s0, s1)?;
 
             read_result
         })
+    }
+
+    fn read_multiple_progbuf_dispatch<V: RiscvValue32>(
+        &mut self,
+        mut address: u64,
+        data: &mut [V],
+    ) -> Result<(), RiscvError> {
+        let mut offset = 0;
+
+        if address & 3 == 0
+            && (data.len() as u64)
+                .checked_mul(4)
+                .and_then(|length| address.checked_add(length))
+                .is_some_and(|end| end <= u32::MAX as u64)
+            && let Some(words) = self.progbuf_multiword_words::<V>(data.len())
+        {
+            offset = self.read_multiple_progbuf_multiword(address, data, words)?;
+            if offset == data.len() {
+                return Ok(());
+            }
+            address += (offset * std::mem::size_of::<V>()) as u64;
+        }
+
+        self.read_multiple_progbuf_single(address, &mut data[offset..])
+    }
+
+    /// Number of RV32 words one Program Buffer execution can move through the
+    /// hart-visible data window, or `None` when the single-word path applies.
+    fn progbuf_multiword_words<V: RiscvValue32>(&self, count: usize) -> Option<usize> {
+        if self.state.xlen_64
+            || std::mem::size_of::<V>() != 4
+            || count < 16
+            || !self.state.dataaccess
+            || !self.state.supports_autoexec
+            || !self.state.memory_access_config.progbuf_multiword()
+        {
+            return None;
+        }
+
+        let dataaddr = self.progbuf_data_address()?;
+        let max_window = ((2048 - dataaddr) / 4) as usize;
+        let mut words = (self.state.data_register_count as usize)
+            .min(self.state.datasize as usize)
+            .min(4)
+            .min(max_window);
+
+        while words >= 2 {
+            let program_len = 2 * words + 1;
+            let fits = if self.state.implicit_ebreak {
+                program_len <= self.state.progbuf_size as usize
+            } else {
+                program_len < self.state.progbuf_size as usize
+            };
+            if fits {
+                return Some(words);
+            }
+            words -= 1;
+        }
+
+        None
+    }
+
+    fn progbuf_data_address(&self) -> Option<u32> {
+        let raw = self.state.dataaddr;
+        let address = if raw & 0x800 != 0 { raw | !0xfff } else { raw };
+        // The generated program uses signed 12-bit load/store immediates.
+        if address & 3 != 0 || address > 2047 {
+            return None;
+        }
+        Some(address)
+    }
+
+    /// Execute the Program Buffer once without transferring a register. The
+    /// resulting command is what `autoexecdata` re-executes.
+    fn execute_progbuf_only(&mut self) -> Result<(), RiscvError> {
+        self.execute_abstract_command(self.postexec_command().0)
+    }
+
+    /// Read `words` RV32 values per Program Buffer execution through the data
+    /// window. Returns how many leading elements were committed; the caller
+    /// finishes the tail with the single-word path.
+    fn read_multiple_progbuf_multiword<V: RiscvValue32>(
+        &mut self,
+        address: u64,
+        data: &mut [V],
+        words: usize,
+    ) -> Result<usize, RiscvError> {
+        let groups = data.len() / words;
+        if groups < 2 {
+            return Ok(0);
+        }
+        let Some(dataaddr) = self.progbuf_data_address() else {
+            return Ok(0);
+        };
+
+        let mut program = Vec::with_capacity(2 * words + 2);
+        for index in 0..words {
+            program.push(assembly::lw((4 * index) as u16, 8, 2, 9));
+            program.push(assembly::sw(dataaddr + 4 * index as u32, 0, 2, 9));
+        }
+        program.push(assembly::addi(8, 8, (4 * words) as i16));
+        self.schedule_setup_program_buffer(&program)?;
+
+        // Prime group 0: s0 = address, then run the program once.
+        self.write_register_xlen(registers::S0, address)?;
+        self.execute_progbuf_only()?;
+
+        let mut autoexec = Abstractauto(0);
+        autoexec.set_autoexecdata(1 << (words - 1));
+        self.write_dm_register(autoexec)?;
+
+        if self.dtm.supports_abstract_batching() {
+            return self.read_multiword_batches(address, data, words, autoexec);
+        }
+
+        let mut completed = 0;
+        let result = (|| -> Result<(), RiscvError> {
+            for group in 0..groups {
+                if group + 1 == groups {
+                    // Draining the last group must not start another read.
+                    self.write_dm_register(Abstractauto(0))?;
+                    self.wait_for_abstract_idle(PROGBUF_TIMEOUT)?;
+                }
+
+                for index in 0..words {
+                    let value = self.read_dm_register_untyped(0x04 + index as u64)?;
+                    data[group * words + index] = V::from_register_value(value);
+                }
+                completed = (group + 1) * words;
+
+                if group + 1 < groups {
+                    // The final data read triggered the next execution.
+                    self.wait_for_progbuf()?;
+                }
+            }
+            Ok(())
+        })();
+
+        let teardown = self.write_dm_register(Abstractauto(0));
+        if let Err(error) = result {
+            let _ = self.clear_abstract_command_error();
+            let _ = teardown;
+            return match error {
+                RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy) => Ok(completed),
+                error => Err(error),
+            };
+        }
+        teardown?;
+        Ok(completed)
+    }
+
+    fn read_multiword_batches<V: RiscvValue32>(
+        &mut self,
+        address: u64,
+        data: &mut [V],
+        words: usize,
+        autoexec: Abstractauto,
+    ) -> Result<usize, RiscvError> {
+        let groups = data.len() / words;
+        let mut first = 0;
+        while first + 1 < groups {
+            let count = (groups - first - 1).min(128 / words);
+            let mut requests = Vec::with_capacity(count * words);
+            for _ in 0..count {
+                for reg in 0..words {
+                    requests.push((
+                        Data0::ADDRESS_OFFSET + reg as u64,
+                        if reg + 1 == words {
+                            self.state.progbuf_multi_read_idle
+                        } else {
+                            0
+                        },
+                    ));
+                }
+            }
+            let results = self.dtm.schedule_read_sequence(&requests)?;
+            match self.wait_for_abstract_idle(PROGBUF_TIMEOUT) {
+                Ok(()) => {
+                    for (index, handle) in results.into_iter().enumerate() {
+                        data[first * words + index] = V::from_register_value(
+                            self.dtm.read_deferred_result(handle)?.into_u32(),
+                        );
+                    }
+                    first += count;
+                }
+                Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy)) => {
+                    // The data window is undefined after an abstract busy error.
+                    // This opt-in path is for RAM, so restart the uncommitted batch.
+                    self.write_dm_register(Abstractauto(0))?;
+                    self.clear_abstract_command_error()?;
+                    let old = self.state.progbuf_multi_read_idle;
+                    self.state.progbuf_multi_read_idle = old.saturating_mul(2).saturating_add(1);
+                    if old == self.state.progbuf_multi_read_idle {
+                        return Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy));
+                    }
+                    self.write_register_xlen(registers::S0, address + (first * words * 4) as u64)?;
+                    self.execute_progbuf_only()?;
+                    self.write_dm_register(autoexec)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Drain the final group without triggering an out-of-range read.
+        self.write_dm_register(Abstractauto(0))?;
+        for index in 0..words {
+            data[first * words + index] = V::from_register_value(
+                self.read_dm_register_untyped(Data0::ADDRESS_OFFSET + index as u64)?,
+            );
+        }
+        Ok(groups * words)
+    }
+
+    fn read_multiple_progbuf_single<V: RiscvValue32>(
+        &mut self,
+        address: u64,
+        data: &mut [V],
+    ) -> Result<(), RiscvError> {
+        self.schedule_setup_program_buffer(&[
+            assembly::lw(0, 8, V::WIDTH as u8, 9),
+            assembly::addi(8, 8, V::WIDTH.byte_width() as i16),
+        ])?;
+
+        if data.len() == 1 {
+            self.schedule_write_address_to_s0_and_exec(address)?;
+            self.wait_for_progbuf()?;
+            let value = self.read_register_xlen(registers::S1)? as u32;
+            data[0] = V::from_register_value(value);
+            return Ok(());
+        }
+
+        let use_autoexec = self.state.supports_autoexec && data.len() >= 16;
+        if use_autoexec {
+            self.read_multiple_autoexec(address, data)
+        } else {
+            self.read_multiple_no_autoexec(address, data)
+        }
     }
 
     /// [About DXLEN, aamsize, and Argument Width](https://github.com/riscv/riscv-debug-spec/issues/1148)
@@ -2539,15 +2860,27 @@ impl<'state> RiscvCommunicationInterface<'state> {
         // A write of DATA0 that arrives while the debug module is busy makes a `Busy` error
         // and it does not store the word. The status of the command therefore gets a test
         // after each group of words, and the group that lost a word runs again.
-        let chunk_size: usize = 256;
+        let chunk_size: usize = 128;
         let mut index = 1;
 
         while index < data.len() {
             let chunk_end = core::cmp::min(index + chunk_size, data.len());
 
-            for value in &data[index..chunk_end] {
-                self.schedule_write_dm_register(Data0((*value).into()))?;
-                self.wait_for_progbuf()?;
+            if self.dtm.supports_abstract_batching() {
+                let values: Vec<u32> = data[index..chunk_end]
+                    .iter()
+                    .map(|value| (*value).into())
+                    .collect();
+                self.dtm.schedule_write_repeated(
+                    Data0::ADDRESS_OFFSET,
+                    &values,
+                    self.state.progbuf_write_idle,
+                )?;
+            } else {
+                for value in &data[index..chunk_end] {
+                    self.schedule_write_dm_register(Data0((*value).into()))?;
+                    self.wait_for_progbuf()?;
+                }
             }
 
             match self.wait_for_abstract_idle(PROGBUF_TIMEOUT) {
@@ -2558,7 +2891,10 @@ impl<'state> RiscvCommunicationInterface<'state> {
 
                     // S0 shows the number of words that the target stored.
                     let current_addr = self.read_register_xlen(registers::S0)?;
-                    let written = ((current_addr - address) / width) as usize;
+                    let written = (current_addr
+                        .checked_sub(address)
+                        .ok_or(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy))?
+                        / width) as usize;
 
                     tracing::warn!(
                         "Autoexec Busy during chunk [{}, {}). S0={:#x}, written={}",
@@ -2568,8 +2904,17 @@ impl<'state> RiscvCommunicationInterface<'state> {
                         written,
                     );
 
-                    if written == 0 || written >= data.len() {
+                    if written < index || written > chunk_end {
                         return Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy));
+                    }
+
+                    let old_delay = self.state.progbuf_write_idle;
+                    self.state.progbuf_write_idle = old_delay.saturating_mul(2).saturating_add(1);
+                    if written == index && old_delay == self.state.progbuf_write_idle {
+                        return Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy));
+                    }
+                    if written == data.len() {
+                        return Ok(());
                     }
 
                     self.autoexec_prime_write_pipeline(
@@ -2634,43 +2979,207 @@ impl<'state> RiscvCommunicationInterface<'state> {
             let s0 = core.save_s0()?;
             let s1 = core.save_s1()?;
 
-            // Setup program buffer for multiple writes
-            // Store value from register s9 into memory,
-            // then increase the address for next write.
-            core.schedule_setup_program_buffer(&[
-                assembly::sw(0, 8, V::WIDTH as u32, 9),
-                assembly::addi(8, 8, V::WIDTH.byte_width() as i16),
-            ])?;
+            let write_result = core.write_multiple_progbuf_dispatch(address, data);
 
-            let use_autoexec = core.state.supports_autoexec && data.len() >= 16;
-
-            let write_result = if use_autoexec {
-                core.write_multiple_autoexec(address, data)
-            } else {
-                core.write_register_xlen(registers::S0, address)
-                    .and_then(|()| core.write_multiple_no_autoexec(data))
-            };
-
-            if use_autoexec {
-                let _ = core.write_dm_register(Abstractauto(0));
-                let _ = core.clear_abstract_command_error();
-                core.state.invalidate_progbuf_cache();
-            }
-
-            let _ = core.restore_s0(s0);
-            let _ = core.restore_s1(s1);
+            core.cleanup_progbuf(s0, s1)?;
 
             write_result
         })
     }
 
-    /// Build a postexec-only abstract command (run the program buffer without a
-    /// register transfer) that strict DM implementations accept.
-    ///
-    /// A `postexec=1, transfer=0` command with `aarsize=0` is rejected as
-    /// `NotSupported` (abstractcs.cmderr=2) by some DMs — notably the HiSilicon
-    /// WS63. Set a valid `aarsize` and `regno=x0` explicitly so the program
-    /// buffer can be executed on those implementations.
+    fn write_multiple_progbuf_dispatch<V: RiscvValue32>(
+        &mut self,
+        mut address: u64,
+        data: &[V],
+    ) -> Result<(), RiscvError> {
+        let mut offset = 0;
+
+        if address & 3 == 0
+            && (data.len() as u64)
+                .checked_mul(4)
+                .and_then(|length| address.checked_add(length))
+                .is_some_and(|end| end <= u32::MAX as u64)
+            && let Some(words) = self.progbuf_multiword_words::<V>(data.len())
+        {
+            offset = self.write_multiple_progbuf_multiword(address, data, words)?;
+            if offset == data.len() {
+                return Ok(());
+            }
+            address += (offset * std::mem::size_of::<V>()) as u64;
+        }
+
+        self.write_multiple_progbuf_single(address, &data[offset..])
+    }
+
+    /// Write `words` RV32 values per Program Buffer execution through the data
+    /// window. Returns how many leading elements were committed.
+    fn write_multiple_progbuf_multiword<V: RiscvValue32>(
+        &mut self,
+        address: u64,
+        data: &[V],
+        words: usize,
+    ) -> Result<usize, RiscvError> {
+        let groups = data.len() / words;
+        if groups < 2 {
+            return Ok(0);
+        }
+        let Some(dataaddr) = self.progbuf_data_address() else {
+            return Ok(0);
+        };
+
+        let mut program = Vec::with_capacity(2 * words + 2);
+        for index in 0..words {
+            program.push(assembly::lw((dataaddr + 4 * index as u32) as u16, 0, 2, 9));
+            program.push(assembly::sw((4 * index) as u32, 8, 2, 9));
+        }
+        program.push(assembly::addi(8, 8, (4 * words) as i16));
+        self.schedule_setup_program_buffer(&program)?;
+
+        // Prime group 0: s0 first (clobbers data0), then reload the payload.
+        self.write_register_xlen(registers::S0, address)?;
+        for (index, value) in data.iter().take(words).enumerate() {
+            let value: u32 = (*value).into();
+            self.schedule_write_dm_register_untyped(0x04 + index as u64, value)?;
+        }
+        self.execute_progbuf_only()?;
+        self.wait_for_abstract_idle(PROGBUF_TIMEOUT)?;
+
+        let mut autoexec = Abstractauto(0);
+        autoexec.set_autoexecdata(1 << (words - 1));
+        self.write_dm_register(autoexec)?;
+
+        if self.dtm.supports_abstract_batching() {
+            return self.write_multiword_batches(address, data, words, autoexec);
+        }
+
+        let mut completed = words;
+        let result = (|| -> Result<(), RiscvError> {
+            for group in 1..groups {
+                for index in 0..words {
+                    let value: u32 = data[group * words + index].into();
+                    self.schedule_write_dm_register_untyped(0x04 + index as u64, value)?;
+                }
+                // Writing the last data register triggers the program.
+                self.wait_for_progbuf()?;
+                completed = (group + 1) * words;
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            let _ = self.write_dm_register(Abstractauto(0));
+            let _ = self.clear_abstract_command_error();
+            return match error {
+                RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy) => {
+                    let current = self.read_register_xlen(registers::S0)?;
+                    let done = current.saturating_sub(address) / (4 * words) as u64;
+                    Ok((done as usize * words).min(data.len()))
+                }
+                error => Err(error),
+            };
+        }
+
+        self.write_dm_register(Abstractauto(0))?;
+        Ok(completed)
+    }
+
+    fn write_multiword_batches<V: RiscvValue32>(
+        &mut self,
+        address: u64,
+        data: &[V],
+        words: usize,
+        autoexec: Abstractauto,
+    ) -> Result<usize, RiscvError> {
+        let groups = data.len() / words;
+        let group_bytes = (words * 4) as u64;
+        let mut first = 1;
+        while first < groups {
+            let count = (groups - first).min(128 / words);
+            let mut requests = Vec::with_capacity(count * words);
+            for group in first..first + count {
+                for reg in 0..words {
+                    requests.push((
+                        Data0::ADDRESS_OFFSET + reg as u64,
+                        data[group * words + reg].into(),
+                        if reg + 1 == words {
+                            self.state.progbuf_multi_write_idle
+                        } else {
+                            0
+                        },
+                    ));
+                }
+            }
+            self.dtm.schedule_write_sequence(&requests)?;
+            match self.wait_for_abstract_idle(PROGBUF_TIMEOUT) {
+                Ok(()) => first += count,
+                Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy)) => {
+                    self.write_dm_register(Abstractauto(0))?;
+                    self.clear_abstract_command_error()?;
+                    let cursor = self.read_register_xlen(registers::S0)?;
+                    let Some(offset) = cursor.checked_sub(address) else {
+                        return Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy));
+                    };
+                    if !offset.is_multiple_of(group_bytes) {
+                        return Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy));
+                    }
+                    let next = (offset / group_bytes) as usize;
+                    if next < first || next > first + count {
+                        return Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy));
+                    }
+                    let old = self.state.progbuf_multi_write_idle;
+                    self.state.progbuf_multi_write_idle = old.saturating_mul(2).saturating_add(1);
+                    if next == first && old == self.state.progbuf_multi_write_idle {
+                        return Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy));
+                    }
+                    first = next;
+                    if first < groups {
+                        self.write_register_xlen(
+                            registers::S0,
+                            address + first as u64 * group_bytes,
+                        )?;
+                        for reg in 0..words {
+                            self.schedule_write_dm_register_untyped(
+                                Data0::ADDRESS_OFFSET + reg as u64,
+                                data[first * words + reg].into(),
+                            )?;
+                        }
+                        self.execute_progbuf_only()?;
+                        first += 1;
+                        if first < groups {
+                            self.write_dm_register(autoexec)?;
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.write_dm_register(Abstractauto(0))?;
+        let cursor = self.read_register_xlen(registers::S0)?;
+        if cursor != address + groups as u64 * group_bytes {
+            return Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy));
+        }
+        Ok(groups * words)
+    }
+
+    fn write_multiple_progbuf_single<V: RiscvValue32>(
+        &mut self,
+        address: u64,
+        data: &[V],
+    ) -> Result<(), RiscvError> {
+        self.schedule_setup_program_buffer(&[
+            assembly::sw(0, 8, V::WIDTH as u32, 9),
+            assembly::addi(8, 8, V::WIDTH.byte_width() as i16),
+        ])?;
+
+        let use_autoexec = self.state.supports_autoexec && data.len() >= 16;
+        if use_autoexec {
+            self.write_multiple_autoexec(address, data)
+        } else {
+            self.write_register_xlen(registers::S0, address)
+                .and_then(|()| self.write_multiple_no_autoexec(data))
+        }
+    }
+
     fn postexec_command(&self) -> AccessRegisterCommand {
         let mut cmd = AccessRegisterCommand(0);
         cmd.set_cmd_type(0);
@@ -2975,6 +3484,144 @@ impl<'state> RiscvCommunicationInterface<'state> {
         })
     }
 
+    /// Probe-side bulk read, if the DTM advertises one for this access engine.
+    fn try_read_multiple_block<V: RiscvValue32>(
+        &mut self,
+        address: u64,
+        data: &mut [V],
+        progbuf: bool,
+    ) -> Option<Result<(), RiscvError>> {
+        if !self.can_offload_memory(address, data.len(), std::mem::size_of::<V>(), progbuf) {
+            return None;
+        }
+        let element_size = std::mem::size_of::<V>();
+        let mut bytes = vec![0u8; std::mem::size_of_val(data)];
+        let result = if progbuf {
+            self.dtm.read_memory_progbuf(
+                self.state.last_selected_hart,
+                element_size as u8,
+                address,
+                &mut bytes,
+            )?
+        } else {
+            self.dtm
+                .read_memory_sba(element_size as u8, address, &mut bytes)?
+        };
+        let result = if progbuf {
+            self.finish_progbuf_offload(result)
+        } else {
+            result
+        };
+        if let Err(error) = result {
+            return Some(Err(error));
+        }
+
+        for (value, chunk) in data.iter_mut().zip(bytes.chunks_exact(element_size)) {
+            let mut raw = 0u32;
+            for (index, byte) in chunk.iter().enumerate() {
+                raw |= (*byte as u32) << (8 * index);
+            }
+            *value = V::from_register_value(raw);
+        }
+
+        Some(Ok(()))
+    }
+
+    /// Probe-side bulk write, if the DTM advertises one for this access engine.
+    fn try_write_multiple_block<V: RiscvValue32>(
+        &mut self,
+        address: u64,
+        data: &[V],
+        progbuf: bool,
+    ) -> Option<Result<(), RiscvError>> {
+        if !self.can_offload_memory(address, data.len(), std::mem::size_of::<V>(), progbuf) {
+            return None;
+        }
+        let element_size = std::mem::size_of::<V>();
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(data));
+        for value in data {
+            let raw: u32 = (*value).into();
+            bytes.extend_from_slice(&raw.to_le_bytes()[..element_size]);
+        }
+
+        let result = if progbuf {
+            self.dtm.write_memory_progbuf(
+                self.state.last_selected_hart,
+                element_size as u8,
+                address,
+                &bytes,
+            )?
+        } else {
+            self.dtm
+                .write_memory_sba(element_size as u8, address, &bytes)?
+        };
+        Some(if progbuf {
+            self.finish_progbuf_offload(result)
+        } else {
+            result
+        })
+    }
+
+    fn can_offload_memory(&self, address: u64, count: usize, size: usize, progbuf: bool) -> bool {
+        let Some(length) = count.checked_mul(size) else {
+            return false;
+        };
+        let Some(end) = address.checked_add(length.saturating_sub(1) as u64) else {
+            return false;
+        };
+        count > 1
+            && self.dtm.supports_memory_access(progbuf)
+            && address.is_multiple_of(size as u64)
+            && (self.state.xlen_64 || end <= u32::MAX as u64)
+            && (!progbuf
+                || (self.state.is_halted
+                    && !self.state.current_dmcontrol.hasel()
+                    && self.state.current_dmcontrol.hartsel() == self.state.last_selected_hart
+                    && !self.state.force_machine_mode_progbuf
+                    && !self.state.syncing_caches
+                    && self.state.s0.stack.is_empty()
+                    && self.state.s1.stack.is_empty()
+                    && self.state.data_register_count >= 2
+                    && self.state.progbuf_size >= 2))
+    }
+
+    fn finish_progbuf_offload(&mut self, result: Result<(), RiscvError>) -> Result<(), RiscvError> {
+        // Firmware owns the buffer and may have changed DMCONTROL even on failure.
+        self.state.invalidate_progbuf_cache();
+        if result.is_err() {
+            self.stop_progbuf_autoexec()
+                .map_err(|error| RiscvError::ProgramBufferCleanupFailed(Box::new(error)))?;
+        }
+        let control: Dmcontrol = self.read_dm_register()?;
+        self.state.current_dmcontrol = control;
+        if self.state.last_selected_hart != control.hartsel() {
+            self.state.last_selected_hart = control.hartsel();
+            self.state.is_halted = false;
+        }
+        result
+    }
+
+    fn checked_memory_range(
+        &self,
+        address: u64,
+        count: usize,
+        width: usize,
+    ) -> Result<Range<u64>, crate::Error> {
+        let length = (count as u64)
+            .checked_mul(width as u64)
+            .ok_or_else(|| crate::Error::Other("memory transfer length overflows".into()))?;
+        let end = address
+            .checked_add(length)
+            .ok_or_else(|| crate::Error::Other("memory transfer address overflows".into()))?;
+        if !self.state.xlen_64 {
+            valid_32bit_address(address)?;
+            if length != 0 {
+                valid_32bit_address(end - 1)?;
+            }
+        }
+        Ok(address..end)
+    }
+
     fn read_word<V: RiscvValue32>(&mut self, address: u64) -> Result<V, crate::Error> {
         if !self.state.xlen_64 {
             valid_32bit_address(address)?;
@@ -2999,10 +3646,8 @@ impl<'state> RiscvCommunicationInterface<'state> {
         address: u64,
         data: &mut [V],
     ) -> Result<(), crate::Error> {
-        if !self.state.xlen_64 {
-            valid_32bit_address(address)?;
-        }
-        let address_range = address..(address + (data.len() * V::WIDTH.byte_width()) as u64);
+        let address_range =
+            self.checked_memory_range(address, data.len(), V::WIDTH.byte_width())?;
         let access_method = self
             .state
             .memory_range_access_method(V::WIDTH, address_range.clone());
@@ -3015,12 +3660,20 @@ impl<'state> RiscvCommunicationInterface<'state> {
 
         match access_method {
             MemoryAccessMethod::ProgramBuffer => {
-                self.perform_memory_read_multiple_progbuf(address, data)?;
+                if let Some(result) = self.try_read_multiple_block(address, data, true) {
+                    result?;
+                } else {
+                    self.perform_memory_read_multiple_progbuf(address, data)?;
+                }
             }
             MemoryAccessMethod::SystemBus => {
                 self.writeback_caches(address_range)?;
 
-                self.perform_memory_read_multiple_sysbus(address, data)?;
+                if let Some(result) = self.try_read_multiple_block(address, data, false) {
+                    result?;
+                } else {
+                    self.perform_memory_read_multiple_sysbus(address, data)?;
+                }
             }
             MemoryAccessMethod::AbstractCommand => {
                 self.perform_memory_read_multiple_abstract_cmd(address, data, false)?;
@@ -3058,21 +3711,29 @@ impl<'state> RiscvCommunicationInterface<'state> {
         address: u64,
         data: &[V],
     ) -> Result<(), crate::Error> {
-        if !self.state.xlen_64 {
-            valid_32bit_address(address)?;
-        }
-        let address_range = address..(address + (data.len() * V::WIDTH.byte_width()) as u64);
+        let address_range =
+            self.checked_memory_range(address, data.len(), V::WIDTH.byte_width())?;
         let access_method = self
             .state
             .memory_range_access_method(V::WIDTH, address_range.clone());
         match access_method {
             MemoryAccessMethod::SystemBus => {
                 self.writeback_caches(address_range.clone())?;
-                self.perform_memory_write_sysbus(address, data)?;
+
+                if let Some(result) = self.try_write_multiple_block(address, data, false) {
+                    result?;
+                } else {
+                    self.perform_memory_write_sysbus(address, data)?;
+                }
+
                 self.invalidate_caches(address_range)?;
             }
             MemoryAccessMethod::ProgramBuffer => {
-                self.perform_memory_write_multiple_progbuf(address, data)?
+                if let Some(result) = self.try_write_multiple_block(address, data, true) {
+                    result?;
+                } else {
+                    self.perform_memory_write_multiple_progbuf(address, data)?;
+                }
             }
             MemoryAccessMethod::AbstractCommand => {
                 self.perform_memory_write_abstract_cmd(address, data, false)?
@@ -3998,7 +4659,172 @@ memory_mapped_bitfield_register! { pub struct Confstrptr3(pub u32); 0x1c, "confs
 
 #[cfg(test)]
 mod tests {
-    use super::HartIsa;
+    use super::*;
+
+    #[derive(Debug)]
+    struct UnusedDtm;
+
+    impl DtmAccess for UnusedDtm {
+        fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+            unreachable!()
+        }
+        fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
+            unreachable!()
+        }
+        fn clear_error_state(&mut self) -> Result<(), RiscvError> {
+            unreachable!()
+        }
+        fn read_deferred_result(
+            &mut self,
+            _: Handle<CommandResult>,
+        ) -> Result<CommandResult, RiscvError> {
+            unreachable!()
+        }
+        fn execute(&mut self) -> Result<(), RiscvError> {
+            unreachable!()
+        }
+        fn schedule_write(
+            &mut self,
+            _: u64,
+            _: u32,
+        ) -> Result<Option<Handle<CommandResult>>, RiscvError> {
+            unreachable!()
+        }
+        fn schedule_read(&mut self, _: u64) -> Result<Handle<CommandResult>, RiscvError> {
+            unreachable!()
+        }
+        fn read_with_timeout(&mut self, _: u64, _: Duration) -> Result<u32, RiscvError> {
+            unreachable!()
+        }
+        fn write_with_timeout(
+            &mut self,
+            _: u64,
+            _: u32,
+            _: Duration,
+        ) -> Result<Option<u32>, RiscvError> {
+            unreachable!()
+        }
+        fn read_idcode(&mut self) -> Result<Option<u32>, DebugProbeError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn multiword_program_buffer_respects_hart_data_window_size() {
+        let mut state = RiscvCommunicationInterfaceState::new();
+        state.memory_access_config.set_progbuf_multiword(true);
+        state.dataaccess = true;
+        state.dataaddr = 0x40;
+        state.data_register_count = 4;
+        state.progbuf_size = 8;
+        state.supports_autoexec = true;
+        let interface = RiscvCommunicationInterface::new(Box::new(UnusedDtm), &mut state);
+        interface.state.datasize = 1;
+        assert_eq!(interface.progbuf_multiword_words::<u32>(128), None);
+        interface.state.datasize = 2;
+        assert_eq!(interface.progbuf_multiword_words::<u32>(128), Some(2));
+        interface.state.datasize = 4;
+        assert_eq!(interface.progbuf_multiword_words::<u32>(128), Some(3));
+    }
+
+    #[test]
+    fn bulk_memory_range_rejects_address_wraparound() {
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let interface = RiscvCommunicationInterface::new(Box::new(UnusedDtm), &mut state);
+        assert_eq!(
+            interface.checked_memory_range(0xffff_fffc, 1, 4).unwrap(),
+            0xffff_fffc..0x1_0000_0000
+        );
+        assert!(interface.checked_memory_range(0xffff_fffc, 2, 4).is_err());
+        assert!(interface.checked_memory_range(u64::MAX, 1, 1).is_err());
+    }
+
+    #[derive(Debug, Default)]
+    struct HaltDtm {
+        results: crate::probe::queue::Results,
+        reads: usize,
+        writes: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+
+    impl DtmAccess for HaltDtm {
+        fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+            unreachable!()
+        }
+        fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
+            unreachable!()
+        }
+        fn clear_error_state(&mut self) -> Result<(), RiscvError> {
+            unreachable!()
+        }
+        fn read_deferred_result(
+            &mut self,
+            handle: Handle<CommandResult>,
+        ) -> Result<CommandResult, RiscvError> {
+            self.results
+                .take(handle)
+                .map_err(|_| RiscvError::BatchedResultNotAvailable)
+        }
+        fn execute(&mut self) -> Result<(), RiscvError> {
+            Ok(())
+        }
+        fn schedule_write(
+            &mut self,
+            _: u64,
+            value: u32,
+        ) -> Result<Option<Handle<CommandResult>>, RiscvError> {
+            self.writes.lock().unwrap().push(value);
+            Ok(None)
+        }
+        fn schedule_read(&mut self, address: u64) -> Result<Handle<CommandResult>, RiscvError> {
+            assert_eq!(address, Dmstatus::ADDRESS_OFFSET);
+            let id = crate::probe::queue::HandleId::new();
+            let value = if self.reads == 0 { 0 } else { 1 << 9 };
+            self.reads += 1;
+            self.results.push(&id, CommandResult::U32(value));
+            Ok(Handle::from_id(id))
+        }
+        fn read_with_timeout(&mut self, _: u64, _: Duration) -> Result<u32, RiscvError> {
+            unreachable!()
+        }
+        fn write_with_timeout(
+            &mut self,
+            _: u64,
+            value: u32,
+            _: Duration,
+        ) -> Result<Option<u32>, RiscvError> {
+            self.writes.lock().unwrap().push(value);
+            Ok(None)
+        }
+        fn read_idcode(&mut self) -> Result<Option<u32>, DebugProbeError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn failed_progbuf_cleanup_does_not_resume_a_previously_running_hart() {
+        let dtm = HaltDtm::default();
+        let writes = dtm.writes.clone();
+        let mut state = RiscvCommunicationInterfaceState::new();
+        state.sw_breakpoint_debug_enabled.insert(0);
+        let mut interface = RiscvCommunicationInterface::new(Box::new(dtm), &mut state);
+        let result = interface.halted_access(|_| -> Result<(), RiscvError> {
+            Err(RiscvError::ProgramBufferCleanupFailed(Box::new(
+                RiscvError::Timeout,
+            )))
+        });
+        assert!(matches!(
+            result,
+            Err(RiscvError::ProgramBufferCleanupFailed(_))
+        ));
+        assert!(interface.state.is_halted);
+        assert!(
+            writes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|value| value & (1 << 30) == 0)
+        );
+    }
 
     #[test]
     fn hart_isa_from_rv32_misa() {
