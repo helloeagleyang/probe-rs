@@ -1,0 +1,193 @@
+name: HPM6P00 Series
+variants:
+- name: HPM6P81xRTx
+  package_variants:
+  - HPM6P81
+  cores:
+  - name: core0
+    type: riscv
+    core_access_options: !Riscv
+      hart_id: 0
+  - name: core1
+    type: riscv
+    core_access_options: !Riscv
+      hart_id: 1
+  memory_map:
+  - !Ram
+    name: ILM0
+    range:
+      start: 0x0
+      end: 0x20000
+    cores:
+    - core0
+  - !Ram
+    name: CPU1_ILM
+    range:
+      start: 0x40000
+      end: 0x60000
+    cores:
+    - core1
+  - !Ram
+    name: DLM0
+    range:
+      start: 0x200000
+      end: 0x220000
+    cores:
+    - core0
+  - !Ram
+    name: CPU1_DLM
+    range:
+      start: 0x240000
+      end: 0x260000
+    cores:
+    - core1
+  - !Ram
+    name: XRAM0
+    range:
+      start: 0x1200000
+      end: 0x1240000
+    cores:
+    - core0
+    - core1
+  - !Nvm
+    name: XPI0
+    range:
+      start: 0x80000000
+      end: 0x80100000
+    cores:
+    - core0
+    - core1
+    access:
+      boot: true
+  - !Ram
+    name: HRAM
+    range:
+      start: 0xf0200000
+      end: 0xf0208000
+    cores:
+    - core0
+    - core1
+  flash_algorithms:
+  - flash-algo-hpm-xpi0-f300-1mb
+- name: HPM6P41xPBx
+  package_variants:
+  - HPM6P41
+  cores:
+  - name: core0
+    type: riscv
+    core_access_options: !Riscv
+      hart_id: 0
+  memory_map:
+  - !Ram
+    name: ILM0
+    range:
+      start: 0x0
+      end: 0x20000
+    cores:
+    - core0
+  - !Ram
+    name: DLM0
+    range:
+      start: 0x200000
+      end: 0x220000
+    cores:
+    - core0
+  - !Ram
+    name: XRAM0
+    range:
+      start: 0x1200000
+      end: 0x1240000
+    cores:
+    - core0
+  - !Nvm
+    name: XPI0
+    range:
+      start: 0x80000000
+      end: 0x80100000
+    cores:
+    - core0
+    access:
+      boot: true
+  - !Ram
+    name: HRAM
+    range:
+      start: 0xf0200000
+      end: 0xf0208000
+    cores:
+    - core0
+  flash_algorithms:
+  - flash-algo-hpm-xpi0-f300-1mb
+- name: HPM6P31xPFx
+  package_variants:
+  - HPM6P31
+  cores:
+  - name: core0
+    type: riscv
+    core_access_options: !Riscv
+      hart_id: 0
+  memory_map:
+  - !Ram
+    name: ILM0
+    range:
+      start: 0x0
+      end: 0x20000
+    cores:
+    - core0
+  - !Ram
+    name: DLM0
+    range:
+      start: 0x200000
+      end: 0x220000
+    cores:
+    - core0
+  - !Ram
+    name: XRAM0
+    range:
+      start: 0x1200000
+      end: 0x1240000
+    cores:
+    - core0
+  - !Nvm
+    name: XPI0
+    range:
+      start: 0x80000000
+      end: 0x80100000
+    cores:
+    - core0
+    access:
+      boot: true
+  - !Ram
+    name: HRAM
+    range:
+      start: 0xf0200000
+      end: 0xf0208000
+    cores:
+    - core0
+  flash_algorithms:
+  - flash-algo-hpm-xpi0-f300-1mb
+flash_algorithms:
+- name: flash-algo-hpm-xpi0-f300-1mb
+  description: HPM 1MB SiP XPI0 (XPI 0xF3000000, opt0 0x5, opt1 0x1000)
+  default: true
+  instructions: NwUAAANFRT8FwTcFAiADJUXxXE2BzzcGAAATBkY/AyVGEBEGkUWChwVFgoCXAAAA54DgGbcFAACDxUU/hcW3BQIgg6VF8ZxRhcM3BgAAEwZGPwMnRhC3BgCAqY6RRREGOoWChwVFgoCXAAAA54AgFhMBAd0IBCMmFQIA1UTRIyAlAyMuNQE3BQAAhUV9Fo1GIwq1PmN31gooAhMGABCBRZcAAADngKAsFAQjrAYANwX5/JVFCQUFZojGzMaQyiOqBgA3BQIgAyVF8XRFvcY3BQDzLAIwBDcJAPOCliqEKeGDKYEQIw4BEmwCaAATBsAPlwAAAOeAwA63BAAAk4REPyOiNAEThYQAbAATBsAPlwAAAOeA4AwFRSOiJBEjgKQAIoUMBIOgxQKAVcRRA6kFAoOpxQETAQEjgoCXAAAA54AACZcAAADngIAGLoi3BQAAg8VFP5XJtwUCIIOlRfEDo4UCYwUDArcGAACThkY/g6dGEDcHAIApj5FFE4VGALKGKoY+hcKHAoMFRYKAlwAAAOeA4AO3BQAAA8VFPwnFAUUjigU+goAFRYKAQREGxiLEAAiXAAAA54CAAkERBsYixAAIlwAAAOeAgP5BEQbGIsQACJcAAADngID+AaAXAwAAZwCDAEERwUZjadYGswagQI2KMwfVAGN95QC2hyqIroiDwggA/RcjAFgABQiFCO37tpUVjpN3xv+T8jUAswb3AGODAgQBSJFIs4hYQBMDwQCT8xgAAsYzY1MAY5IDBJP4KABjlwgEskiTA0cAE5gyADODVUBj7tMESaCqhjMHxQBja+UOCaJjctcOLoiDKAgAIyAXAREHEQjjatf++aADyAUAIwADAQVIk/goAOONCPqziAUBg5gIABqYIxAYAbJIkwNHABOYMgAzg1VAY/fTArMDAEGT84MBRo6DKEMAM14OAREDs554ADPuzgGTDocAIyDHAREH4+He/oVDIwQBACMDAQBjnHIAgUOBQoFOEw6BABP/FQBjEQ8CHaiDQ0MAg0JTACMEcQCiAolOEw5hABP/FQBjDg8AdpMDQ0MAIwBuAANDYQCDQ4EAQgOzYlMAMwMAQZ6SE3ODATPYCAGzmGIAM+gIASMgBwG+lQ2KM4fGAGP65gADxwUAfRYjgOYAhQaFBW36QQGCgMFGY2jWBLMGoECNijMH1QBjeeUAtocqiP0XIwC4AAUI5f8VjpN2xv+6lmN+1wC3BwEBE/j1D5OHFxCzB/gCHMMRB+Nu1/4NijOHxgBj6OYAGaiqhjMHxQBjd+UAfRYjgLYAhQZl/oKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  load_address: 0x20
+  pc_init: 0x70
+  pc_uninit: 0x194
+  pc_program_page: 0x14a
+  pc_erase_sector: 0x34
+  pc_erase_all: 0x0
+  data_section_offset: 0x4dc
+  flash_properties:
+    address_range:
+      start: 0x80000000
+      end: 0x80100000
+    page_size: 0x100
+    erased_byte_value: 0xff
+    program_page_timeout: 1000
+    erase_sector_timeout: 2000
+    sectors:
+    - size: 0x1000
+      address: 0x0
+  cores:
+  - core0
+  stack_size: 2048

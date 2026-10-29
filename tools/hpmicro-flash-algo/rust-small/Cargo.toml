@@ -1,0 +1,35 @@
+[package]
+name = "hpm-small-flash-algo"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Small CMSIS flash algorithm for HPM 1 MiB SiP XPI0 flash"
+
+# Keep this tool out of the probe-rs workspace.
+[workspace]
+
+[dependencies]
+flash-algorithm = { version = "0.4.0", default-features = false, features = [
+    "erase-chip",
+] }
+panic-halt = "0.2.0"
+
+[features]
+# XPI0 base 0xF3000000: HPM5300, HPM6P00, HPM5E00
+xpi-f300 = []
+# XPI0 base 0xF00E0000: HPM5100
+xpi-f00e = []
+
+[[bin]]
+name = "flash-algo"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+codegen-units = 1
+debug = 2
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = false
