@@ -1,0 +1,1 @@
+Added HPM Probe X USB support (VID 0x34b7, PID 0x8003/0xe001). The RISC-V DMI tunnel uses advertised SBA and Program Buffer memory offloads when safe and supports four-wire JTAG and, with compatible firmware, two-wire cJTAG. Physical reset-pin control is not supported.

@@ -9,6 +9,7 @@ pub mod cmsisdap;
 pub mod fake_probe;
 pub mod ftdi;
 pub mod glasgow;
+pub mod hpmprobe;
 pub mod jlink;
 pub mod jtag;
 pub mod list;
@@ -73,6 +74,7 @@ static DRIVERS: LazyLock<RwLock<Vec<&'static dyn ProbeFactory>>> = LazyLock::new
         &stlink::StLinkFactory,
         &jlink::JLinkFactory,
         &wlink::WchLinkFactory,
+        &hpmprobe::HpmProbeFactory,
         &sifliuart::SifliUartFactory,
         &glasgow::GlasgowFactory,
         &ch347::Ch347Factory,

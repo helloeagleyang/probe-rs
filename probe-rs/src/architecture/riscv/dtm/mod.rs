@@ -1,5 +1,6 @@
 //! Debug Transport Module (DTM) access abstraction
 
+pub(crate) mod hpm_probe_dtm;
 pub mod jtag_dtm;
 pub(crate) mod mem_ap_dtm;
 pub(crate) mod wlink_dtm;
