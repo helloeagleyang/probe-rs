@@ -7,6 +7,7 @@ use probe_rs::probe::{
     DebugProbeError, DebugProbeSelector, Probe, WireProtocol,
     ch347::{Ch347, Ch347Config},
     ftdi::{FtdiConfig, FtdiProbe},
+    hpmprobe::{HpmProbe, HpmProbeConfig},
     list::{ProbeListItem, ProbeLister},
     target_serial::{HostSerialPort, LineState, PortSelector, SerialSettings, TargetSerial},
     usb_util::UsbSerialFilter,
@@ -33,6 +34,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// type = "ftdi"
 /// uart = "b"
 /// uart_reset = "esp"
+///
+/// [probes."34b7:8003".driver]
+/// type = "hpmprobe"
+/// transport = "cjtag"
+/// mode = "raw"
 ///
 /// [probes."0403:6010-1".serial]
 /// usb = "1a86:7523"
@@ -95,6 +101,7 @@ pub struct ProbeConfig {
 pub enum DriverConfig {
     Ch347(Ch347Config),
     Ftdi(FtdiConfig),
+    Hpmprobe(HpmProbeConfig),
 }
 
 impl DriverConfig {
@@ -116,6 +123,10 @@ impl DriverConfig {
                 .downcast_mut::<FtdiProbe>()
                 .ok_or_else(mismatch)?
                 .configure(config),
+            DriverConfig::Hpmprobe(config) => (probe.driver_mut() as &mut dyn Any)
+                .downcast_mut::<HpmProbe>()
+                .ok_or_else(mismatch)?
+                .configure(config),
         }
     }
 
@@ -123,6 +134,7 @@ impl DriverConfig {
         match self {
             DriverConfig::Ch347(_) => "CH347",
             DriverConfig::Ftdi(_) => "FTDI",
+            DriverConfig::Hpmprobe(_) => "HPM Probe X",
         }
     }
 }
@@ -460,6 +472,34 @@ mod tests {
             config.driver,
             Some(DriverConfig::Ch347(Ch347Config::default()))
         );
+    }
+
+    #[test]
+    fn hpmprobe_cjtag_settings_are_parsed() {
+        use probe_rs::probe::hpmprobe::{HpmProbeMode, HpmProbeTransport};
+
+        let configs = configs(
+            r#"
+            ["34b7:8003".driver]
+            type = "hpmprobe"
+            transport = "cjtag"
+            mode = "raw"
+        "#,
+        );
+        assert_eq!(
+            configs.resolve(&probe("34b7:8003")).driver,
+            Some(DriverConfig::Hpmprobe(HpmProbeConfig {
+                transport: Some(HpmProbeTransport::Cjtag),
+                mode: Some(HpmProbeMode::RawJtag),
+            }))
+        );
+        assert!(is_rejected(
+            r#"
+            ["34b7:8003".driver]
+            type = "hpmprobe"
+            transport = "swd"
+        "#
+        ));
     }
 
     #[test]
