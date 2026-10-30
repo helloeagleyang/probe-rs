@@ -157,7 +157,41 @@ The first 16 KiB write passed before the reset fix, but a subsequent run timed
 out in reset-and-halt before erasing. A diagnostic alternated three short
 `ndmreset` pulses, none of which were acknowledged, with three pulses held for
 1 ms, all of which were acknowledged. The successful repeated runs above use
-the 1 ms hold. At the user's request, the test data was left in the four test
+the 1 ms hold. At the user's request, the test data was left in the test
 sectors; no original flash contents were restored. After `--start`, the hart
 reported running and two halted-PC samples were `0x8000e320` in the XIP
 window; application behavior was not checked.
+
+### FT2232H flashloader throughput
+
+The same board, flash algorithm and 15 MHz configured JTAG speed were tested
+with the optimized probe-rs code at `ff8fcb56`. Each sample used a fresh FTDI
+session, sector erase, double-buffered programming and readback verification.
+The 1, 4 and 16 KiB payloads were measured five times each; the larger payloads
+were measured three times each. The table reports the median of each column.
+
+| Payload | Erase (ms) | Program (ms) | Verify (ms) | Total (ms) | Program (KiB/s) | Total (KiB/s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 KiB | 83.5 | 13.1 | 2.1 | 121.6 | 76.1 | 8.2 |
+| 4 KiB | 85.5 | 37.5 | 8.5 | 151.8 | 106.7 | 26.4 |
+| 16 KiB | 253.1 | 136.5 | 34.4 | 445.7 | 117.2 | 35.9 |
+| 64 KiB | 897.6 | 518.9 | 136.4 | 1584.8 | 123.3 | 40.4 |
+| 256 KiB | 3543.6 | 2076.8 | 551.8 | 6192.8 | 123.3 | 41.3 |
+| 1 MiB | 13923.0 | 8319.2 | 2208.2 | 24555.1 | 123.1 | 41.7 |
+
+The erase phase includes flash algorithm setup; the program phase includes
+algorithm setup, buffer transfers and target programming. Total is the sum
+of session attachment and the complete flash commit, including erase, program,
+verify and commit overhead. It excludes process startup, test data generation,
+guard reads and the final reset/run. Each throughput divides payload bytes by
+the corresponding phase time. The independently calculated column medians
+need not add up to the median total. The 1 KiB case erases one 4 KiB sector.
+
+The test wrote only `0x80eff000..0x80fff000`, a 1 MiB region. Before writing
+outside the earlier four-sector test area, independent SBA and Program Buffer
+reads confirmed the additional region contained only `0xff`. All samples
+passed flashloader verification. A final independent Program Buffer read
+matched the complete 1 MiB test pattern and both neighboring 4 KiB guards;
+the first flash sector was also unchanged. Test data remained in flash without
+restoration. The hart subsequently reported running and its sampled PC was in
+the XIP window; application behavior was not tested.
