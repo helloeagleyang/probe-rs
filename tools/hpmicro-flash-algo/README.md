@@ -123,7 +123,41 @@ for 1 MiB SiP parts. The ROM API queries the actual flash size, so an 8 MiB or
 - Package base-name aliases resolve to the first package in `hpm_socs.yaml`.
   For HPM6700 VMx vs ANx, `--chip HPM6750` selects the VMx/option-0xE
   algorithm; use `HPM6750xANx` for the channel-B board.
-- **No hardware validation was performed for this change.** Recommended order:
-  HPM6P00EVK, HPM5100EVK, HPM5300EVK, HPM6750EVK, HPM6E00EVK, HPM6800EVK,
-  then HPM6300/HPM6200/HPM5E00. For each: flash, verify, reset, run; dual-core
-  parts also attach `--core 1`.
+- HPM6800EVK has received the initial single-board test below. The remaining
+  generated algorithms and boards still need hardware validation. For each:
+  flash, verify, reset, run; dual-core parts also attach `--core 1`.
+
+## HPM6800EVK hardware test
+
+On 2026-10-30, the `HPM6880xBDx` target and
+`hpm-xpi0-f300-opt5-32mb` algorithm were tested using an FT2232H over JTAG.
+The probe was configured for 15 MHz when 25 MHz was requested. Independent
+OpenOCD probing reported a 16 MiB NOR with 4 KiB sectors. The target IDCODE,
+`0x1000563d`, is shared by multiple HPM parts and does not identify the board
+on its own. The physical JTAG waveform was not measured.
+
+The test used `probe-rs download --verify` with binary images near the end of
+the board's 16 MiB XPI0 flash. After fixing the RISC-V reset pulse, each case
+passed twice in successive sessions:
+
+| Payload | Address | Scope | End-to-end time |
+| --- | --- | --- | --- |
+| 1 KiB | `0x80ffb180` | Unaligned, spans five 256-byte pages | 0.37, 0.38 s |
+| 4 KiB | `0x80ffc000` | One complete sector | 0.40, 0.40 s |
+| 16 KiB | `0x80ffb000` | Four complete sectors | 0.69, 0.71 s |
+
+Times include process startup, probe attachment, erase, programming and
+verification; the final 16 KiB run also requested `--start`. Separate
+readbacks checked the entire 16 KiB test region, a 4 KiB guard on either side,
+and the first flash sector after every run. The partial write used the default
+erase behavior: other bytes in its sector became `0xff`. The test did not
+exercise chip erase or `--restore-unwritten`.
+
+The first 16 KiB write passed before the reset fix, but a subsequent run timed
+out in reset-and-halt before erasing. A diagnostic alternated three short
+`ndmreset` pulses, none of which were acknowledged, with three pulses held for
+1 ms, all of which were acknowledged. The successful repeated runs above use
+the 1 ms hold. At the user's request, the test data was left in the four test
+sectors; no original flash contents were restored. After `--start`, the hart
+reported running and two halted-PC samples were `0x8000e320` in the XIP
+window; application behavior was not checked.

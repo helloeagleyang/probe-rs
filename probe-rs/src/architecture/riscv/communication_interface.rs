@@ -3907,6 +3907,10 @@ impl<'state> RiscvCommunicationInterface<'state> {
 
             self.write_dm_register(dmcontrol)?;
 
+            // Some reset controllers sample ndmreset asynchronously; a short DMI
+            // transaction alone may not hold it long enough to be observed.
+            std::thread::sleep(Duration::from_millis(1));
+
             tracing::debug!("Clearing ndmreset bit");
             dmcontrol.set_ndmreset(false);
             dmcontrol.set_haltreq(true);
@@ -4798,6 +4802,98 @@ mod tests {
         fn read_idcode(&mut self) -> Result<Option<u32>, DebugProbeError> {
             unreachable!()
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct TimedResetDtm {
+        results: crate::probe::queue::Results,
+        reset_asserted_at: Option<Instant>,
+        reset_observed: bool,
+    }
+
+    impl TimedResetDtm {
+        fn write(&mut self, address: u64, value: u32) {
+            if address != Dmcontrol::ADDRESS_OFFSET {
+                return;
+            }
+            let control = Dmcontrol(value);
+            if control.ndmreset() {
+                self.reset_asserted_at.get_or_insert_with(Instant::now);
+            } else if let Some(start) = self.reset_asserted_at.take() {
+                // Model a reset controller that does not sample shorter pulses.
+                self.reset_observed = start.elapsed() >= Duration::from_millis(1);
+            }
+        }
+    }
+
+    impl DtmAccess for TimedResetDtm {
+        fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+            unreachable!()
+        }
+        fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
+            unreachable!()
+        }
+        fn clear_error_state(&mut self) -> Result<(), RiscvError> {
+            unreachable!()
+        }
+        fn read_deferred_result(
+            &mut self,
+            handle: Handle<CommandResult>,
+        ) -> Result<CommandResult, RiscvError> {
+            self.results
+                .take(handle)
+                .map_err(|_| RiscvError::BatchedResultNotAvailable)
+        }
+        fn execute(&mut self) -> Result<(), RiscvError> {
+            Ok(())
+        }
+        fn schedule_write(
+            &mut self,
+            address: u64,
+            value: u32,
+        ) -> Result<Option<Handle<CommandResult>>, RiscvError> {
+            self.write(address, value);
+            Ok(None)
+        }
+        fn schedule_read(&mut self, address: u64) -> Result<Handle<CommandResult>, RiscvError> {
+            let value = match address {
+                Dmcontrol::ADDRESS_OFFSET => 1, // hartreset is not supported
+                Dmstatus::ADDRESS_OFFSET => {
+                    (0b11 << 8) | if self.reset_observed { 0b11 << 18 } else { 0 }
+                }
+                Abstractcs::ADDRESS_OFFSET | Data0::ADDRESS_OFFSET => 0,
+                _ => panic!("unexpected DMI read at {address:#x}"),
+            };
+            let id = crate::probe::queue::HandleId::new();
+            self.results.push(&id, CommandResult::U32(value));
+            Ok(Handle::from_id(id))
+        }
+        fn read_with_timeout(&mut self, _: u64, _: Duration) -> Result<u32, RiscvError> {
+            unreachable!()
+        }
+        fn write_with_timeout(
+            &mut self,
+            address: u64,
+            value: u32,
+            _: Duration,
+        ) -> Result<Option<u32>, RiscvError> {
+            self.write(address, value);
+            Ok(None)
+        }
+        fn read_idcode(&mut self) -> Result<Option<u32>, DebugProbeError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn ndmreset_is_held_long_enough_for_target_to_observe_it() {
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut interface =
+            RiscvCommunicationInterface::new(Box::new(TimedResetDtm::default()), &mut state);
+
+        interface
+            .reset_hart_and_halt(Duration::from_millis(20))
+            .unwrap();
     }
 
     #[test]
