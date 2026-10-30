@@ -1,4 +1,4 @@
-//! Destructive-to-RAM Probe X HIL test. Supply a scratch region and a backup path.
+//! Destructive-to-RAM Probe X or FTDI HIL test. Supply scratch RAM and a backup path.
 
 use std::{
     fs::OpenOptions,
@@ -18,16 +18,24 @@ use probe_rs::{
     },
     architecture::riscv::{Abstractcs, Data0, Dmstatus},
     probe::{
-        BitSequence, DebugProbeError, DebugProbeSelector, JtagBatch, Probe, TapState,
+        BitSequence, DebugProbeError, DebugProbeSelector, JtagBatch, Probe, ProbeFactory, TapState,
+        WireProtocol,
+        ftdi::FtdiProbeFactory,
         hpmprobe::{HpmProbe, HpmProbeMode, HpmProbeTransport},
     },
 };
 
 #[derive(Parser)]
 struct Args {
+    /// Probe driver: `probex` or `ftdi`.
+    #[arg(long, default_value = "probex")]
+    adapter: String,
     /// Probe selector (VID:PID[:serial]).
     #[arg(long, default_value = "34b7:8003")]
     probe: DebugProbeSelector,
+    /// Requested JTAG frequency in kHz.
+    #[arg(long, default_value_t = 25_000)]
+    speed: u32,
     /// Optional expected JTAG IDCODE; refuse to test a different target.
     #[arg(long, value_parser = parse_address)]
     expected_idcode: Option<u64>,
@@ -62,23 +70,46 @@ fn parse_address(value: &str) -> Result<u64> {
 }
 
 fn with_interface<T>(
-    selector: &DebugProbeSelector,
+    args: &Args,
     mode: HpmProbeMode,
     physical_transport: HpmProbeTransport,
-    expected_idcode: Option<u64>,
+    speed: u32,
     f: impl FnOnce(&mut RiscvCommunicationInterface<'_>) -> Result<T>,
 ) -> Result<T> {
-    let mut probe = Probe::new(HpmProbe::open_with_transport(
-        selector,
-        mode,
-        physical_transport,
-    )?);
-    let actual = probe.set_speed(25_000)?;
-    ensure!(
-        actual == 25_000,
-        "requested 25 MHz, probe reported {actual} kHz"
-    );
+    let mut probe = if args.adapter == "ftdi" {
+        Probe::from_specific_probe(FtdiProbeFactory.open(&args.probe)?)
+    } else {
+        Probe::new(HpmProbe::open_with_transport(
+            &args.probe,
+            mode,
+            physical_transport,
+        )?)
+    };
+    probe.select_protocol(WireProtocol::Jtag)?;
+    probe.set_speed(speed)?;
     probe.attach_to_unspecified()?;
+    let actual = probe.speed_khz();
+    ensure!(
+        actual > 0 && actual <= speed,
+        "unexpected probe speed: {actual} kHz"
+    );
+    ensure!(
+        args.adapter != "probex" || actual == speed,
+        "requested {speed} kHz, Probe X reported {actual} kHz"
+    );
+    if args.adapter == "ftdi" {
+        let mut chain = probe.try_as_jtag_chain().context("JTAG unavailable")?;
+        chain.select(0).context("FTDI chain discovery failed")?;
+        let idcodes = chain.idcodes();
+        ensure!(idcodes.len() == 1, "expected a single TAP, got {idcodes:?}");
+        if let Some(expected) = args.expected_idcode {
+            ensure!(
+                idcodes[0].map(u64::from) == Some(expected),
+                "FTDI chain IDCODE {:?} does not match {expected:#010x}",
+                idcodes[0]
+            );
+        }
+    }
     if mode == HpmProbeMode::RawJtag && physical_transport == HpmProbeTransport::Cjtag {
         let mut chain = probe.try_as_jtag_chain().context("raw JTAG unavailable")?;
         chain
@@ -111,7 +142,7 @@ fn with_interface<T>(
             .map_err(|_| anyhow::anyhow!("raw cJTAG IDCODE result missing"))?
             .as_bits()
             .load_le::<u32>();
-        if let Some(expected) = expected_idcode {
+        if let Some(expected) = args.expected_idcode {
             ensure!(
                 u64::from(idcode) == expected,
                 "raw cJTAG IDCODE {idcode:#010x} does not match {expected:#010x}"
@@ -126,13 +157,19 @@ fn with_interface<T>(
     let idcode = interface
         .read_idcode()?
         .context("target has no JTAG IDCODE")?;
-    if let Some(expected) = expected_idcode {
+    if let Some(expected) = args.expected_idcode {
         ensure!(
             u64::from(idcode) == expected,
             "target IDCODE {idcode:#010x} does not match {expected:#010x}"
         );
     }
-    println!("{mode:?} {physical_transport:?} target IDCODE {idcode:#010x}, {actual} kHz");
+    if args.adapter == "ftdi" {
+        println!(
+            "FTDI JTAG target IDCODE {idcode:#010x}, requested {speed} kHz, configured {actual} kHz"
+        );
+    } else {
+        println!("{mode:?} {physical_transport:?} target IDCODE {idcode:#010x}, {actual} kHz");
+    }
     let result = f(&mut interface);
     drop(interface);
     probe.detach()?;
@@ -181,6 +218,17 @@ fn check_debug_state(interface: &mut RiscvCommunicationInterface<'_>) -> Result<
         dmstatus.0 & 0x200 != 0,
         "target did not remain halted: {:#x}",
         dmstatus.0
+    );
+    Ok(())
+}
+
+fn print_debug_state(interface: &mut RiscvCommunicationInterface<'_>, label: &str) -> Result<()> {
+    let dmstatus: Dmstatus = interface.read_dm_register()?;
+    let auto: Abstractauto = interface.read_dm_register()?;
+    let status: Abstractcs = interface.read_dm_register()?;
+    println!(
+        "{label}: dmstatus={:#010x}, abstractauto={:#010x}, abstractcs={:#010x}",
+        dmstatus.0, auto.0, status.0
     );
     Ok(())
 }
@@ -398,6 +446,11 @@ fn exercise(
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(
+        ["probex", "ftdi"].contains(&args.adapter.as_str()),
+        "invalid adapter"
+    );
+    ensure!(args.speed > 0, "speed must be nonzero");
+    ensure!(
         args.address >= 64 && args.address.is_multiple_of(4),
         "address must be aligned and leave room for the guard"
     );
@@ -414,6 +467,13 @@ fn main() -> Result<()> {
         "cjtag" => HpmProbeTransport::Cjtag,
         _ => bail!("invalid transport: expected jtag or cjtag"),
     };
+    if args.adapter == "ftdi" {
+        ensure!(
+            physical_transport == HpmProbeTransport::Jtag,
+            "the FTDI HIL test supports JTAG only"
+        );
+        ensure!(args.mode != "direct", "FTDI has no Probe X direct mode");
+    }
     ensure!(
         ["all", "sba", "progbuf"].contains(&args.method.as_str()),
         "invalid method"
@@ -436,12 +496,19 @@ fn main() -> Result<()> {
         .open(&args.backup)
         .context("backup must be a new file")?;
 
+    // Use a conservative FTDI clock for backup and recovery.
+    let recovery_speed = if args.adapter == "ftdi" {
+        args.speed.min(15_000)
+    } else {
+        args.speed
+    };
     let (original, was_running) = with_interface(
-        &args.probe,
+        &args,
         HpmProbeMode::Direct,
         physical_transport,
-        args.expected_idcode,
+        recovery_speed,
         |interface| {
+            print_debug_state(interface, "Before test")?;
             let was_running = halt(interface)?;
             let result = (|| -> Result<Vec<u32>> {
                 method(interface, MemoryAccessMethod::SystemBus);
@@ -471,28 +538,25 @@ fn main() -> Result<()> {
 
     let test_result = (|| -> Result<()> {
         for mode in [HpmProbeMode::Direct, HpmProbeMode::RawJtag] {
-            if (args.mode == "direct" && mode != HpmProbeMode::Direct)
+            if (args.adapter == "ftdi" && mode == HpmProbeMode::Direct)
+                || (args.mode == "direct" && mode != HpmProbeMode::Direct)
                 || (args.mode == "raw" && mode != HpmProbeMode::RawJtag)
             {
                 continue;
             }
-            with_interface(
-                &args.probe,
-                mode,
-                physical_transport,
-                args.expected_idcode,
-                |interface| exercise(interface, mode, &args, &original),
-            )?;
+            with_interface(&args, mode, physical_transport, args.speed, |interface| {
+                exercise(interface, mode, &args, &original)
+            })?;
         }
         Ok(())
     })();
 
-    // Always try to restore through a fresh direct session, even after a failed test.
+    // Always try to restore through a fresh session, even after a failed test.
     let restore = with_interface(
-        &args.probe,
+        &args,
         HpmProbeMode::Direct,
         physical_transport,
-        args.expected_idcode,
+        recovery_speed,
         |interface| {
             halt(interface)?;
             method(interface, MemoryAccessMethod::SystemBus);
@@ -505,6 +569,7 @@ fn main() -> Result<()> {
             if was_running {
                 interface.resume_core()?;
             }
+            print_debug_state(interface, "After restoration")?;
             Ok(())
         },
     );

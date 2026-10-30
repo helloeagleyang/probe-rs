@@ -54,8 +54,9 @@ DMI reads and uses the Debug Module's system-bus auto-increment support.
 
 ## Hardware test
 
-`probe-rs/examples/hpm_probex_hil.rs` tests direct and raw modes with SBA and
-Program Buffer reads and writes at 25 MHz. It tests 8-, 16-, and 32-bit
+`probe-rs/examples/hpm_probex_hil.rs` tests Probe X direct and raw modes and
+FTDI JTAG with SBA and Program Buffer reads and writes. It defaults to a
+requested 25 MHz. It tests 8-, 16-, and 32-bit
 accesses, short transfers, and, when the scratch area is large enough, transfers
 spanning the 8,176-byte packet boundary. It checks writes using the other
 memory engine, checks 64-byte guard regions, the halted/autoexec state,
@@ -79,6 +80,13 @@ path. Add `--transport cjtag` to run the same checks and 25 MHz measurements
 through cJTAG. Use `--words 256` or `--words 1024` for 1 KiB or 4 KiB
 transfers. The backup is retained if restoration fails; a disconnected probe
 can prevent automatic restoration.
+
+To test an FT2232H using its first channel and the generic JTAG path, use
+`--adapter ftdi --probe 0403:6010 --mode raw`. The requested speed can be set
+with `--speed` in kHz. FT2232H cannot produce exactly 25 MHz: its divider
+configures 15 MHz for that request. The tool reports the configured speed
+after attachment and uses at most 15 MHz for FTDI backup and recovery. The
+FTDI test supports JTAG; Probe X's direct and cJTAG modes do not apply.
 
 ### HPM5100EVK cJTAG results
 
@@ -204,6 +212,81 @@ measurements, not a throughput guarantee for other targets or firmware.
 The SBA rows use the same SBA implementation; enabling Program Buffer
 multiword changes the verification path, not the timed SBA transfer. All nine
 sessions completed their checks and independently verified restoration.
+
+### HPM6800EVK FT2232H JTAG results
+
+On 2026-10-30, an FT2232H (`0403:6010`, channel A) was connected to the
+HPM6800EVK fixture. The target IDCODE was `0x1000563d`, which does not by
+itself distinguish the HPM6800 from other HPM families. A release build used
+the generic JTAG path and RAM at `0x10000`, with 64-byte guards. Each value is
+the median of three independent sessions, each containing five timed transfers
+after the correctness checks. Times include the probe-rs memory operation,
+including host, USB and target overhead, but exclude verification.
+
+The 15 MHz columns use the standard driver, which configures 15 MHz when
+25 MHz is requested. The 30 MHz columns are **experimental**: an isolated
+build changes the FTDI input edge to falling by using `0x24` instead of
+`0x20` for captured commands in the three `Command::encode` arms in
+`probe-rs/src/probe/ftdi/command_compacter.rs`. This is not a configurable
+feature of the standard driver. At 30 MHz an OpenOCD rising-edge scan returned
+a shifted JTAG IDCODE on this fixture; an OpenOCD falling-edge scan and the
+experimental build succeeded. The clock values are configured values;
+the physical waveform was not measured.
+
+| Size | Memory method | Program Buffer multiword | 15 MHz read KiB/s | 15 MHz write KiB/s | 30 MHz experimental read KiB/s | 30 MHz experimental write KiB/s |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 1 KiB | SBA | Off | 532.6 | 541.0 | 718.9 | 688.8 |
+| 1 KiB | SBA | On | 523.3 | 550.3 | 685.6 | 734.6 |
+| 1 KiB | Program Buffer | Off | 224.2 | 246.7 | 226.3 | 249.2 |
+| 1 KiB | Program Buffer | On | 244.8 | 237.3 | 238.9 | 230.3 |
+| 4 KiB | SBA | Off | 550.9 | 549.9 | 691.8 | 703.8 |
+| 4 KiB | SBA | On | 544.5 | 549.8 | 748.3 | 735.7 |
+| 4 KiB | Program Buffer | Off | 311.0 | 316.0 | 287.1 | 293.3 |
+| 4 KiB | Program Buffer | On | 382.5 | 376.1 | 357.9 | 349.4 |
+| 16 KiB | SBA | Off | 547.3 | 548.9 | 712.0 | 657.5 |
+| 16 KiB | SBA | On | 553.7 | 531.8 | 727.5 | 720.1 |
+| 16 KiB | Program Buffer | Off | 342.8 | 343.5 | 366.0 | 364.0 |
+| 16 KiB | Program Buffer | On | 445.2 | 437.8 | 418.9 | 413.3 |
+
+All 36 sessions passed their data, guard, selected-register and debug-state
+checks and independently verified RAM restoration. Their backups match the
+corresponding portions of the original 16 KiB region and guards; a final
+standard-driver run also confirmed that entire region. Separate host-side
+breakpoints confirmed the multiword read and write batch functions executed;
+that run is excluded from the table. The hart was running before and after,
+`abstractauto` was zero, and no hart-reset status bits were set. Multiword
+changes only Program Buffer transfers, not SBA; the two SBA rows show normal
+measurement variation.
+
+### FT2232H comparison with the pre-series baseline
+
+The same HPM6800EVK and FT2232H were tested again at a configured 15 MHz. The
+baseline was commit `4ab4984799f855759d3a824f91fb95ca08f48c44`, before this
+patch series; the optimized build used the reviewed series. These are
+whole-version comparisons, including any optimizations already present in the
+baseline, rather than attribution to an individual patch.
+
+Both release builds used identical temporary test code and alternated on the
+same hardware. Program Buffer multiword was disabled in both. Each value is
+the median of three independent sessions, with five timed full-length, 32-bit
+transfers per session. Read and write speeds are in KiB/s.
+
+| Size | Memory method | Baseline read | Optimized read | Baseline write | Optimized write |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 KiB | SBA | 227.2 | 505.2 | 516.4 | 500.2 |
+| 1 KiB | Program Buffer | 50.6 | 219.1 | 40.7 | 244.0 |
+| 4 KiB | SBA | 226.9 | 527.0 | 549.7 | 539.9 |
+| 4 KiB | Program Buffer | 52.7 | 311.1 | 41.2 | 320.4 |
+| 16 KiB | SBA | 231.6 | 523.3 | 555.1 | 530.6 |
+| 16 KiB | Program Buffer | 53.0 | 335.9 | 41.7 | 344.5 |
+
+All 18 comparison sessions verified the full-length data, guards, selected
+registers, debug state and restoration. The comparison deliberately skipped
+short and subword checks: separate baseline tests returned abstract-command
+`Busy` during a three-byte Program Buffer check and a three-word Program Buffer
+read. The full-length measurements therefore do not establish that the
+baseline is reliable for smaller transfers. A final standard-driver check
+confirmed the complete test region matched its original backup.
 
 ## Audit notes
 
