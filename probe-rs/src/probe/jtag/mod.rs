@@ -410,8 +410,12 @@ fn enter_tdi(target: TapState) -> bool {
 
 /// One step of a JTAG batch on the wire.
 pub(crate) enum Step<'a> {
-    /// Clock `path` on TMS, with TDI at `tdi`.
-    Tms { path: &'a [bool], tdi: bool },
+    /// Clock `path` on TMS, with TDI at `tdi`, to reach `target`.
+    Tms {
+        path: &'a [bool],
+        tdi: bool,
+        target: TapState,
+    },
     /// Shift `data` on TDI with TMS low. With `exit`, the last bit is clocked with TMS high
     /// instead, which is the first step out of Shift. `exit` is only set when `data` is not
     /// empty.
@@ -442,6 +446,7 @@ pub(crate) fn walk_batch(
                 emit(Step::Tms {
                     path: &state.path_to(*target)[skip..],
                     tdi: enter_tdi(*target),
+                    target: *target,
                 })?;
                 skip = 0;
                 *state = *target;
@@ -572,7 +577,7 @@ fn lower_batch<P: BitbangJtag>(
 ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
     let results = Results::new();
     let walked = walk_batch(state, batch, |step| match step {
-        Step::Tms { path, tdi } => path
+        Step::Tms { path, tdi, .. } => path
             .iter()
             .try_for_each(|&tms| probe.shift(tms, tdi, false)),
         Step::Shift {

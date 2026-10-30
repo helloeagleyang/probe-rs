@@ -327,7 +327,7 @@ fn collect_ftdi_commands(
     let mut commands = Vec::new();
     walk_batch(&mut state, batch, |step| {
         commands.extend(match step {
-            Step::Tms { path, tdi } => Command::encode_tms_path(path, tdi),
+            Step::Tms { path, tdi, .. } => Command::encode_tms_path(path, tdi),
             Step::Shift {
                 data,
                 exit,

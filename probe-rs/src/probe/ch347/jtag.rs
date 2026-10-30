@@ -241,7 +241,7 @@ fn encode(
     let mut state = start;
     walk_batch(&mut state, batch, |step| {
         match step {
-            Step::Tms { path, tdi } => {
+            Step::Tms { path, tdi, .. } => {
                 for &tms in path {
                     encoder.cycle(Cycle { tms, tdi }, Tdo::Ignore);
                 }

@@ -5,6 +5,7 @@
 //! firmware's standard SBA or Program Buffer commands when probe-rs selects
 //! those engines.
 
+mod jtag;
 pub(crate) mod protocol;
 mod usb;
 
@@ -21,21 +22,26 @@ use self::protocol::{
 };
 use self::usb::{HpmUsbTransport, is_probe};
 
-use crate::architecture::riscv::dtm::hpm_probe_dtm::HpmProbeDtmBuilder;
+use crate::architecture::riscv::dtm::{
+    hpm_probe_dtm::HpmProbeDtmBuilder, jtag_dtm::JtagDtmBuilder,
+};
 use crate::probe::{
-    DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, ProbeCreationError,
-    ProbeFactory, ResetLine, WireProtocol,
+    DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, JtagChain, JtagChainAccess,
+    JtagChainState, ProbeCreationError, ProbeFactory, ResetLine, WireProtocol,
     list::{ProbeListItem, usb_probe_accessibility},
 };
 
 const PROBE_NAME: &str = "HPM Probe";
 
-/// Selects probe-side RISC-V commands.
+/// Selects probe-side memory acceleration or host-driven raw JTAG sequences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HpmProbeMode {
     /// Use the probe's RISC-V DMI and memory commands.
     Direct,
+    /// Use raw JTAG sequences and probe-rs's generic RISC-V implementation.
+    #[serde(rename = "raw")]
+    RawJtag,
 }
 
 /// Physical transport used for the JTAG protocol.
@@ -61,7 +67,7 @@ impl HpmProbeTransport {
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HpmProbeConfig {
-    /// Choose probe-accelerated commands.
+    /// Choose probe-accelerated commands or raw JTAG sequences.
     pub mode: Option<HpmProbeMode>,
     /// Choose the physical JTAG transport.
     pub transport: Option<HpmProbeTransport>,
@@ -158,6 +164,9 @@ pub struct HpmProbe {
     reset_line: ResetLine,
     mode: HpmProbeMode,
     physical_transport: HpmProbeTransport,
+    jtag_state: JtagChainState,
+    jtag_max_clocks: usize,
+    jtag_failed: bool,
 }
 
 impl fmt::Debug for HpmProbe {
@@ -240,10 +249,16 @@ impl HpmProbe {
             reset_line: ResetLine::default(),
             mode,
             physical_transport,
+            jtag_state: JtagChainState::default(),
+            jtag_max_clocks: 0,
+            jtag_failed: false,
         };
 
         probe.handshake()?;
         if configure_now {
+            if mode == HpmProbeMode::RawJtag {
+                probe.init_raw_jtag(physical_transport)?;
+            }
             probe.configure_transport(DEFAULT_SPEED_KHZ * 1_000)?;
         }
         Ok(probe)
@@ -259,8 +274,12 @@ impl HpmProbe {
         if mode == self.mode && physical_transport == self.physical_transport {
             return Ok(());
         }
+        if mode == HpmProbeMode::RawJtag {
+            self.init_raw_jtag(physical_transport)?;
+        }
         self.mode = mode;
         self.physical_transport = physical_transport;
+        self.jtag_state = JtagChainState::default();
         if self.configured {
             self.configure_transport(self.clock_hz)?;
         }
@@ -296,6 +315,8 @@ impl HpmProbe {
         self.configured = true;
         self.clock_hz = actual_hz;
         self.speed_khz = ((u64::from(actual_hz) + 500) / 1_000) as u32;
+        // The firmware's TAP reset ends in Run-Test/Idle.
+        self.jtag_state.tap_state = crate::probe::TapState::RunTestIdle;
         Ok(actual_hz)
     }
 
@@ -521,6 +542,10 @@ impl DebugProbe for HpmProbe {
 
     fn attach(&mut self) -> Result<(), DebugProbeError> {
         if !self.configured {
+            if self.mode == HpmProbeMode::RawJtag {
+                self.jtag_state = JtagChainState::default();
+                self.init_raw_jtag(self.physical_transport)?;
+            }
             self.ensure_configured()?;
         }
         self.attached = true;
@@ -572,6 +597,14 @@ impl DebugProbe for HpmProbe {
         true
     }
 
+    fn try_as_jtag_chain(&mut self) -> Option<JtagChain<'_>> {
+        (self.mode == HpmProbeMode::RawJtag).then(|| JtagChain::new(self))
+    }
+
+    fn try_as_jtag_chain_access_mut(&mut self) -> Option<&mut dyn JtagChainAccess> {
+        (self.mode == HpmProbeMode::RawJtag).then_some(self)
+    }
+
     fn try_get_riscv_interface_builder<'probe>(
         &'probe mut self,
     ) -> Result<
@@ -581,7 +614,10 @@ impl DebugProbe for HpmProbe {
         >,
         crate::architecture::riscv::communication_interface::RiscvError,
     > {
-        Ok(Box::new(HpmProbeDtmBuilder::new(self)))
+        match self.mode {
+            HpmProbeMode::Direct => Ok(Box::new(HpmProbeDtmBuilder::new(self))),
+            HpmProbeMode::RawJtag => Ok(Box::new(JtagDtmBuilder::new(self))),
+        }
     }
 
     fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {

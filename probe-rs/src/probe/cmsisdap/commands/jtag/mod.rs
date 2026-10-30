@@ -77,7 +77,7 @@ fn encode_jtag_batch(
     let mut requests = Vec::new();
 
     walk_batch(&mut state, batch, |step| match step {
-        Step::Tms { path, tdi } => {
+        Step::Tms { path, tdi, .. } => {
             for (tms, run_length) in tms_runs(path) {
                 let data = BitVec::repeat(tdi, run_length);
                 buffer.push_into(tms, &data, false, &mut requests)?;

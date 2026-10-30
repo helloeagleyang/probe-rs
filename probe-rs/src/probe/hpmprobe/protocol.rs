@@ -17,6 +17,7 @@ pub const LEGACY_PRODUCT_ID: u16 = 0xE001;
 
 pub const TUNNEL_CONTROL: u8 = 0x00;
 pub const TUNNEL_RISCV: u8 = 0x01;
+pub const TUNNEL_JTAG: u8 = 0x02;
 
 pub const FRAME_HEADER_SIZE: usize = 4;
 pub const MAX_PAYLOAD: usize = 8192;
@@ -34,6 +35,10 @@ pub const RISCV_SELECT_HART: u8 = 0x06;
 
 pub const CAP_MEMORY_PROGBUF: u32 = 1 << 19;
 pub const CAP_MEMORY_SBA: u32 = 1 << 30;
+pub const JTAG_GET_INTERFACE_INFO: u8 = 0x01;
+pub const JTAG_SEQUENCE: u8 = 0x07;
+pub const JTAG_CAP_SEQUENCE: u32 = 1 << 2;
+pub const JTAG_CAP_CJTAG_RAW: u32 = 1 << 3;
 
 pub const RISCV_READ_MEMORY_PROGBUF: u8 = 0x1e;
 pub const RISCV_WRITE_MEMORY_PROGBUF: u8 = 0x1f;
